@@ -39,7 +39,7 @@ graph TD
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/yourusername/ai-phishing-email-detection.git
+git clone https://github.com/ventz/ai-phishing-email-detection.git
 cd ai-phishing-email-detection
 ```
 
@@ -114,24 +114,32 @@ The system uses the following environment variables:
 
 ## Local Testing
 
-You can test the Lambda function locally using the included test script:
+You can test and interact with your emails using the tools provided in the repository:
 
 ```bash
-python test_lambda.py --bucket your-s3-bucket-name [--key specific-object-key]
-```
+# List emails stored in S3
+python tools/list-s3-emails.py
 
-If no specific object key is provided, the script will list available objects in the bucket and allow you to select one interactively.
+# Display the contents of a specific email
+python tools/display-s3-email.py --bucket your-s3-bucket-name --key specific-object-key
+
+# Trigger lambda function with a specific email
+python tools/trigger-lambda-email.py --bucket your-s3-bucket-name --key specific-object-key
+```
 
 ## Project Structure
 
 ```
 .
 ├── lambda_function.py     # Main Lambda function code
-├── package.sh             # Script to package Lambda function for deployment
-├── requirements.txt       # Python dependencies
-├── terraform.tf           # Terraform configuration
-├── test_lambda.py         # Local testing script
-└── README.md              # This file
+├── LICENSE               # MIT License file
+├── README.md             # This file
+├── requirements.txt      # Python dependencies
+├── terraform.tf          # Terraform configuration
+└── tools/                # Utility scripts
+    ├── display-s3-email.py      # Tool to display email contents
+    ├── list-s3-emails.py        # Tool to list emails in S3
+    └── trigger-lambda-email.py  # Tool to trigger Lambda with a specific email
 ```
 
 ## Security Considerations
@@ -147,4 +155,4 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+This project is licensed under the MIT License - see the [LICENSE](https://github.com/ventz/ai-phishing-email-detection/blob/main/LICENSE) file for details.
