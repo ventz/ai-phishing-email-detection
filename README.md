@@ -43,16 +43,7 @@ git clone https://github.com/ventz/ai-phishing-email-detection.git
 cd ai-phishing-email-detection
 ```
 
-### 2. Configure AWS credentials for Bedrock
-
-Create a `.env` file with your AWS credentials for Bedrock access:
-
-```
-AI_AWS_ACCESS_KEY_ID=your_access_key
-AI_AWS_SECRET_ACCESS_KEY=your_secret_key
-```
-
-### 3. Deploy with Terraform
+### 2. Deploy with Terraform
 
 Initialize Terraform:
 
@@ -60,18 +51,10 @@ Initialize Terraform:
 terraform init
 ```
 
-Apply the configuration:
+Copy the sample terraform variables file, and modify the variables as needed:
 
 ```bash
-terraform apply -var-file="terraform.tfvars"
-```
-
-You'll need to create a `terraform.tfvars` file with the following variables:
-
-```
-ai_aws_access_key_id     = "your_access_key_id"
-ai_aws_secret_access_key = "your_secret_access_key"
-default_forwarder_catch_all = "your_catch_all_email@example.com"
+cp terraform.tfvars.sample terraform.tfvars
 ```
 
 Optional GitHub integration for catch-all emails:
@@ -81,7 +64,13 @@ github_repo_owner = "your_github_username_or_org"
 github_repo_name  = "your_repo_name"
 ```
 
-### 4. Configure SES
+Apply the configuration:
+
+```bash
+terraform apply -var-file="terraform.tfvars"
+```
+
+### 3. Configure SES
 
 Ensure that your SES service is properly configured:
 - Verify the sender domain and email addresses
@@ -102,8 +91,6 @@ The system uses the following environment variables:
 | GITHUB_TOKEN | GitHub token for creating issues | - | No |
 | GITHUB_REPO_OWNER | GitHub repository owner | - | No |
 | GITHUB_REPO_NAME | GitHub repository name | - | No |
-| AI_AWS_ACCESS_KEY_ID | AWS access key ID for Bedrock API | - | Yes |
-| AI_AWS_SECRET_ACCESS_KEY | AWS secret access key for Bedrock API | - | Yes |
 
 ## Usage
 

@@ -1,0 +1,5 @@
+ses_domain_name             = "yourdomain.com"
+default_forwarder_catch_all = "no-reply@yourdomain.com"
+ses_email_sender            = "no-reply@yourdomain.com"
+ses_phishing_email_receiver = "phishing@yourdomain.com"
+aws_region                  = "us-east-1"
