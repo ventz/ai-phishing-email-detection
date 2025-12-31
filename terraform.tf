@@ -6,6 +6,14 @@ provider "aws" {
   region = var.aws_region
 }
 
+data "aws_caller_identity" "current" {}
+data "aws_region" "current" {}
+
+locals {
+  aws_account_id = data.aws_caller_identity.current.account_id
+  aws_region     = data.aws_region.current.region
+}
+
 # Variables
 variable "aws_region" {
   description = "AWS region to deploy resources"
@@ -67,24 +75,6 @@ variable "github_repo_name" {
   default     = ""
 }
 
-variable "ai_aws_access_key_id" {
-  description = "AWS Access Key ID for AI services"
-  type        = string
-  sensitive   = true
-}
-
-variable "ai_aws_secret_access_key" {
-  description = "AWS Secret Access Key for AI services"
-  type        = string
-  sensitive   = true
-}
-
-variable "aws_account_id" {
-  description = "AWS Account ID"
-  type        = string
-  default     = "573509232434"
-}
-
 variable "ses_configuration_set" {
   description = "SES Configuration Set Name"
   type        = string
@@ -93,10 +83,10 @@ variable "ses_configuration_set" {
 
 # S3 Bucket for storing emails
 resource "aws_s3_bucket" "phishing_emails" {
-  bucket = var.s3_bucket_name
+  bucket = "${var.s3_bucket_name}-${local.aws_account_id}"
 
   tags = {
-    Name        = "${var.project_name}-bucket"
+    Name        = "${var.s3_bucket_name}-${local.aws_account_id}"
     Environment = "production"
     Project     = var.project_name
   }
@@ -132,7 +122,7 @@ resource "aws_s3_bucket_policy" "phishing_emails_policy" {
         Resource  = "${aws_s3_bucket.phishing_emails.arn}/*",
         Condition = {
           StringEquals = {
-            "aws:Referer" = var.aws_account_id
+            "aws:Referer" = local.aws_account_id
           }
         }
       }
@@ -155,7 +145,7 @@ resource "aws_cloudwatch_log_group" "lambda_logs" {
 # IAM Role for Lambda Execution
 resource "aws_iam_role" "lambda_execution_role" {
   name = "${var.project_name}-role"
-  
+
   assume_role_policy = jsonencode({
     Version = "2012-10-17",
     Statement = [
@@ -207,8 +197,8 @@ resource "aws_iam_policy" "lambda_ses_send_email_policy" {
         Effect = "Allow",
         Action = "ses:SendEmail",
         Resource = [
-          "arn:aws:ses:${var.aws_region}:${var.aws_account_id}:identity/${var.ses_email_sender}",
-          "arn:aws:ses:${var.aws_region}:${var.aws_account_id}:configuration-set/${var.ses_configuration_set}"
+          "arn:aws:ses:${local.aws_region}:${local.aws_account_id}:identity/${var.ses_domain_name}",
+          "arn:aws:ses:${local.aws_region}:${local.aws_account_id}:configuration-set/${var.ses_configuration_set}"
         ]
       }
     ]
@@ -284,36 +274,72 @@ resource "aws_lambda_permission" "allow_s3_invoke" {
   source_arn    = aws_s3_bucket.phishing_emails.arn
 }
 
+# Create lambda package directory with dependencies
+resource "null_resource" "install_dependencies" {
+  triggers = {
+    requirements = filemd5("${path.module}/requirements.txt")
+    lambda_code  = filemd5("${path.module}/lambda_function.py")
+  }
+
+  provisioner "local-exec" {
+    command = <<-EOT
+      # Create a temporary directory for packaging
+      rm -rf ${path.module}/lambda_package
+      mkdir -p ${path.module}/lambda_package
+
+      # Install dependencies to the package directory
+      pip install -r ${path.module}/requirements.txt -t ${path.module}/lambda_package/
+
+      # Copy the lambda function code
+      cp ${path.module}/lambda_function.py ${path.module}/lambda_package/
+
+      # Create the zip file
+      cd ${path.module}/lambda_package && zip -r ../function.zip .
+
+      # Clean up temporary directory
+      rm -rf ${path.module}/lambda_package
+    EOT
+  }
+}
+
+# Create the zip file using Terraform's archive_file
+data "archive_file" "lambda_zip" {
+  depends_on = [null_resource.install_dependencies]
+
+  type        = "zip"
+  source_dir  = "${path.module}/lambda_package"
+  output_path = "${path.module}/function.zip"
+}
+
 # Lambda Function
 resource "aws_lambda_function" "phishing_email_detection" {
   function_name = var.project_name
   role          = aws_iam_role.lambda_execution_role.arn
   handler       = "lambda_function.lambda_handler"
-  runtime       = "python3.12"
+  runtime       = "python3.13"
   timeout       = 60  # 60 seconds timeout
-  memory_size   = 256  # 256 MB memory
+  memory_size   = 256 # 256 MB memory
 
   # Path to your deployment package
-  filename         = "${path.module}/function.zip"
-  source_code_hash = filebase64sha256("${path.module}/function.zip")
+  filename         = data.archive_file.lambda_zip.output_path
+  source_code_hash = data.archive_file.lambda_zip.output_base64sha256
 
   environment {
     variables = {
-      SES_DOMAIN_NAME           = var.ses_domain_name
-      SES_EMAIL_SENDER          = var.ses_email_sender
+      SES_DOMAIN_NAME             = var.ses_domain_name
+      SES_EMAIL_SENDER            = var.ses_email_sender
       SES_PHISHING_EMAIL_RECEIVER = var.ses_phishing_email_receiver
-      SES_CONFIG_SET_NAME       = var.ses_configuration_set
+      SES_CONFIG_SET_NAME         = var.ses_configuration_set
       DEFAULT_FORWARDER_CATCH_ALL = var.default_forwarder_catch_all
-      AI_AWS_ACCESS_KEY_ID      = var.ai_aws_access_key_id
-      AI_AWS_SECRET_ACCESS_KEY  = var.ai_aws_secret_access_key
-      GITHUB_TOKEN              = var.github_token
-      GITHUB_REPO_OWNER         = var.github_repo_owner
-      GITHUB_REPO_NAME          = var.github_repo_name
+      GITHUB_TOKEN                = var.github_token
+      GITHUB_REPO_OWNER           = var.github_repo_owner
+      GITHUB_REPO_NAME            = var.github_repo_name
     }
   }
 
   depends_on = [
-    aws_cloudwatch_log_group.lambda_logs
+    aws_cloudwatch_log_group.lambda_logs,
+    data.archive_file.lambda_zip
   ]
 
   tags = {
