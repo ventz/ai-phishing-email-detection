@@ -18,17 +18,18 @@ Environment Variables:
     GITHUB_REPO_NAME: Optional GitHub repository name for issue creation
 """
 
-import json
-import os
-import logging
-from typing import Tuple, Dict, Any, Optional, List, Union
-import boto3
 import email
-from email import policy
-from email.parser import BytesParser
-from email.message import EmailMessage
-from botocore.exceptions import ClientError
+import json
+import logging
+import os
 from datetime import datetime
+from email import policy
+from email.message import EmailMessage
+from email.parser import BytesParser
+from typing import Any, Dict, Optional, Tuple
+
+import boto3
+from botocore.exceptions import ClientError
 
 # Configure logging
 logger = logging.getLogger()
@@ -36,10 +37,7 @@ logger.setLevel(logging.INFO)
 
 # Set up the Amazon Bedrock client
 bedrock_runtime = boto3.client(
-    service_name='bedrock-runtime',
-    region_name='us-east-1',
-    aws_access_key_id=os.environ.get("AI_AWS_ACCESS_KEY_ID"),
-    aws_secret_access_key=os.environ.get("AI_AWS_SECRET_ACCESS_KEY")
+    service_name="bedrock-runtime",
 )
 
 # Initialize SES client
