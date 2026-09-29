@@ -1,0 +1,46 @@
+[project]
+name = "phishing-detector"
+version = "2.0.0"
+description = "Forward a suspicious email, get back a phishing verdict and an explanation. SES + S3 + Lambda + Claude on Amazon Bedrock."
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Ventz Petkov" }]
+requires-python = ">=3.13"
+dependencies = [
+    "anthropic[bedrock]>=1.9,<2",
+    "boto3>=1.40",
+    "pydantic>=2.11,<3",
+]
+
+[project.scripts]
+phishing-tools = "phishing_detector.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4",
+    "ruff>=0.13",
+]
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/phishing_detector"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "SIM", "RUF"]
+ignore = ["S101", "RUF001", "RUF003"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S", "E501", "E741"]

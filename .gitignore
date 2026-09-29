@@ -1,0 +1,43 @@
+# Local / private (never commit)
+CLAUDE.md
+CLAUDE.local.md
+.claude/
+.mcp.json
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+private/
+.private/
+sessions/
+.sessions/
+*.session
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+
+# Build output
+build/
+function.zip
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+*.tfplan
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json

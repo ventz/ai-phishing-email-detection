@@ -1,158 +1,117 @@
 # AI Phishing Email Detection
 
-A serverless AWS solution that uses Anthropic Claude AI to analyze forwarded emails and determine if they are phishing attempts or legitimate emails. The system provides detailed explanations to help users understand why an email was classified as phishing or clean, serving as an educational tool.
+<a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+<img src="https://img.shields.io/badge/python-3.13-blue.svg" alt="Python 3.13">
+<img src="https://img.shields.io/badge/AWS-Lambda%20%7C%20SES%20%7C%20Bedrock-orange.svg" alt="AWS Lambda, SES and Bedrock">
+
+Forward a suspicious email to one address and get a reply within a minute: a verdict (phishing,
+suspicious, or likely safe) plus the specific red flags that led to it, so people learn to spot the
+next one. It runs serverless on AWS with Claude on Amazon Bedrock.
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Quick Install](#quick-install)
+- [Features](#features)
+- [Usage](#usage)
+- [Architecture](#architecture)
+- [Documentation](#documentation)
+- [Contributing](#contributing)
+- [License](#license)
+
+## Overview
+
+Security teams get a steady stream of "is this real?" emails. This project answers them
+automatically. A user forwards the email to an address like `phishing@example.org`. The service
+then pulls out the evidence that matters: sender and reply-to mismatches, SPF/DKIM/DMARC results,
+where each link *really* points, and the attachments. Claude classifies the email, and the user gets
+a clear, accessible reply that explains why.
+
+It is built for organizations that already use Amazon SES. Replies go only to authenticated
+forwarders in your domains, so the address can't be abused to send mail on your behalf.
+
+## Quick Install
+
+```bash
+git clone https://github.com/ventz/ai-phishing-email-detection.git && cd ai-phishing-email-detection
+uv sync && ./scripts/build.sh
+cp terraform/terraform.tfvars.example terraform/terraform.tfvars   # edit: bucket, sender, receiver, domains
+cd terraform && terraform init && terraform apply
+```
+
+Requires Python 3.13, [uv](https://docs.astral.sh/uv/), Terraform 1.5+, and an SES-verified domain
+with receiving enabled. See [Getting Started](docs/getting-started.md) for SES setup, Bedrock model
+access, and adopting an existing deployment.
+
+## Features
+
+- **Structured verdicts**: phishing / suspicious / likely safe, with a confidence level, concrete
+  indicators, and "how to spot it" tips. The output is schema-validated, not parsed from free text.
+- **Evidence the model can use**: parses forwards sent as attachments and inline forwards from
+  Gmail and Outlook. It compares HTML link text with the real targets, lists attachments with their
+  SHA-256 hashes, and flags a plain-text part that disagrees with the HTML.
+- **Resistant to prompt injection**: email content is fenced as untrusted data, and text that tries
+  to steer the verdict counts against the email.
+- **Safe by default**: a failed analysis never says "safe". Every URL in the reply is defanged
+  (`hxxps://evil[.]example`). Replies go only to DMARC-authenticated forwarders, optionally
+  restricted to your domains.
+- **Accessible replies**: meet WCAG 2.2 AA contrast, work in dark mode, always include a
+  plain-text part, and state the verdict first.
+- **Hardened AWS setup**: no static keys, and the IAM policy is least-privilege. The S3 bucket is
+  encrypted, TLS-only, and expires old emails. Duplicate replies are prevented, failed emails go to
+  a queue with an alarm, and concurrency is capped.
+- **Operator CLI**: list stored emails, see exactly what the model sees, run an analysis locally,
+  or replay an email through the deployed function.
+
+## Usage
+
+For users: forward a suspicious email to your phishing address. Forwarding it as an attachment
+gives the best results, because it keeps the original headers. The reply arrives in about 10–20 seconds.
+
+For operators:
+
+```bash
+export AWS_PROFILE=my-profile AWS_REGION=us-east-1 PHISHING_BUCKET=example-org-phishing-emails
+uv run phishing-tools list                              # newest stored emails
+uv run phishing-tools show --key <key>                  # evidence exactly as the model sees it
+uv run phishing-tools analyze --key <key> --html r.html # classify locally; sends nothing
+```
+
+See [Operations](docs/operations.md) for replaying emails, the failure queue, and logs.
 
 ## Architecture
 
 ```mermaid
-graph TD
-    User[User] -->|Forwards suspicious email| SES[AWS SES]
-    SES -->|Stores email| S3[S3 Bucket]
-    S3 -->|Triggers| Lambda[Lambda Function]
-    Lambda -->|Extracts email content| Process[Process Email]
-    Process -->|Sends for analysis| Bedrock[AWS Bedrock]
-    Bedrock -->|Claude AI analysis| Lambda
-    Lambda -->|Sends classification & explanation| SES
-    SES -->|Delivers response| User
+graph LR
+    accTitle: Phishing analysis flow
+    accDescr: A user forwards an email to SES. SES stores it in S3, which triggers Lambda. Lambda sends the extracted evidence to Claude on Amazon Bedrock, then emails the verdict back to the user through SES.
+    User -->|forwards email| SES[Amazon SES]
+    SES -->|stores raw email| S3[(S3)]
+    S3 -->|object created| Lambda[Lambda]
+    Lambda -->|evidence| Bedrock[Claude on Bedrock]
+    Bedrock -->|verdict| Lambda
+    Lambda -->|reply| SES
+    SES -->|verdict + explanation| User
 ```
 
-## Features
+A user forwards an email to SES, which stores it in S3 and triggers the Lambda function. The
+function sends the extracted evidence to Claude on Bedrock and replies with the verdict through
+SES. Details are in [Architecture](docs/architecture.md).
 
-- **Email Forwarding**: Users can forward suspicious emails to a dedicated email address for analysis
-- **AI-Powered Analysis**: Uses Anthropic Claude 3 Sonnet via AWS Bedrock to analyze emails
-- **Detailed Explanations**: Provides educational feedback on why an email was classified as phishing or legitimate
-- **Serverless Architecture**: Fully serverless implementation using AWS Lambda, S3, and SES
-- **Infrastructure as Code**: Complete Terraform configuration for easy deployment
+## Documentation
 
-## Prerequisites
-
-- AWS Account with appropriate permissions
-- AWS CLI configured with admin access
-- Terraform installed (v1.0.0+)
-- Python 3.12+
-- Access to AWS Bedrock with Claude models enabled
-- You need to have a domain already setup and verified with AWS SES
-- You need to have one email (ex: noreply@yourdomain) already added and verified with SES so that you can send notifications/replies. Ideally, you will have a *.@domain
-
-## Setup and Deployment
-
-### 1. Clone the repository
-
-```bash
-git clone https://github.com/ventz/ai-phishing-email-detection.git
-cd ai-phishing-email-detection
-```
-
-### 2. Configure AWS credentials for Bedrock
-
-Create a `.env` file with your AWS credentials for Bedrock access:
-
-```
-AI_AWS_ACCESS_KEY_ID=your_access_key
-AI_AWS_SECRET_ACCESS_KEY=your_secret_key
-```
-
-### 3. Deploy with Terraform
-
-Initialize Terraform:
-
-```bash
-terraform init
-```
-
-Apply the configuration:
-
-```bash
-terraform apply -var-file="terraform.tfvars"
-```
-
-You'll need to create a `terraform.tfvars` file with the following variables:
-
-```
-ai_aws_access_key_id     = "your_access_key_id"
-ai_aws_secret_access_key = "your_secret_access_key"
-default_forwarder_catch_all = "your_catch_all_email@example.com"
-```
-
-Optional GitHub integration for catch-all emails:
-```
-github_token      = "your_github_token"
-github_repo_owner = "your_github_username_or_org"
-github_repo_name  = "your_repo_name"
-```
-
-### 4. Configure SES
-
-Ensure that your SES service is properly configured:
-- Verify the sender domain and email addresses
-- Move out of the SES sandbox if needed
-- Configure the receipt rule set to be active
-
-## Environment Variables
-
-The system uses the following environment variables:
-
-| Variable | Description | Default | Required |
-|----------|-------------|---------|----------|
-| SES_DOMAIN_NAME | Domain name for SES | domain.tld | Yes |
-| SES_EMAIL_SENDER | Email address to use as the sender | noreply@SES_DOMAIN_NAME | Yes |
-| SES_PHISHING_EMAIL_RECEIVER | Email address to receive forwarded emails | phishing@SES_DOMAIN_NAME | Yes |
-| SES_CONFIG_SET_NAME | SES Configuration Set Name | AWS-SES-Send-Email | Yes |
-| DEFAULT_FORWARDER_CATCH_ALL | Catch-all email when forwarder can't be determined | - | Yes |
-| GITHUB_TOKEN | GitHub token for creating issues | - | No |
-| GITHUB_REPO_OWNER | GitHub repository owner | - | No |
-| GITHUB_REPO_NAME | GitHub repository name | - | No |
-| AI_AWS_ACCESS_KEY_ID | AWS access key ID for Bedrock API | - | Yes |
-| AI_AWS_SECRET_ACCESS_KEY | AWS secret access key for Bedrock API | - | Yes |
-
-## Usage
-
-1. Users forward suspicious emails to the configured email address (default: `SES_PHISHING_EMAIL_RECEIVER`)
-2. The system automatically processes the email and analyzes it with Claude AI
-3. A response email is sent back to the user with the classification (PHISHING or CLEAN) and a detailed explanation
-4. If an email is sent to the catch-all address, a GitHub issue will be created if GitHub integration is configured
-
-## Local Testing
-
-You can test and interact with your emails using the tools provided in the repository:
-
-```bash
-# List emails stored in S3
-python tools/list-s3-emails.py
-
-# Display the contents of a specific email
-python tools/display-s3-email.py --bucket your-s3-bucket-name --key specific-object-key
-
-# Trigger lambda function with a specific email
-python tools/trigger-lambda-email.py --bucket your-s3-bucket-name --key specific-object-key
-```
-
-## Project Structure
-
-```
-.
-├── lambda_function.py     # Main Lambda function code
-├── LICENSE               # MIT License file
-├── README.md             # This file
-├── requirements.txt      # Python dependencies
-├── terraform.tf          # Terraform configuration
-└── tools/                # Utility scripts
-    ├── display-s3-email.py      # Tool to display email contents
-    ├── list-s3-emails.py        # Tool to list emails in S3
-    └── trigger-lambda-email.py  # Tool to trigger Lambda with a specific email
-```
-
-## Security Considerations
-
-- The Lambda function uses environment variables for sensitive information
-- IAM roles are configured with least privilege access
-- S3 bucket is configured with private access
-- SES is configured to handle emails securely
+| Guide | What's in it |
+|-------|--------------|
+| [Getting Started](docs/getting-started.md) | SES and Bedrock prerequisites, first deploy, adopting an existing deployment |
+| [Configuration](docs/configuration.md) | Every Terraform variable and environment variable |
+| [Architecture](docs/architecture.md) | Request flow, security model, design decisions |
+| [Operations](docs/operations.md) | CLI, logs, failure queue, replays, cost |
+| [Security Policy](SECURITY.md) | Reporting vulnerabilities |
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and tests.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](https://github.com/ventz/ai-phishing-email-detection/blob/main/LICENSE) file for details.
+[MIT](LICENSE) © Ventz Petkov
