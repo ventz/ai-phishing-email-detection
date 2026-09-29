@@ -1,0 +1,18 @@
+# Copy to terraform.tfvars (git-ignored) and edit.
+
+s3_bucket_name              = "example-org-phishing-emails"
+ses_email_sender            = "noreply@example.org"
+ses_phishing_email_receiver = "phishing@example.org"
+
+# Only people in your organization get replies.
+allowed_sender_domains = ["example.org"]
+
+# Optional
+# help_contact                = "help@example.org"
+# default_forwarder_catch_all = "security-team@example.org"
+# ses_configuration_set       = "my-config-set"
+# receipt_rule_set_name       = "RECEIVE"   # existing active rule set
+# create_receipt_rule_set     = false       # true only in a fresh account
+# model_id                    = "anthropic.claude-opus-5-5"
+# model_effort                = "low"
+# email_retention_days        = 90
