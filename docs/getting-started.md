@@ -90,6 +90,10 @@ import {
 }
 ```
 
+If you deployed from the December 2025 single-file Terraform, its bucket is named
+`<s3_bucket_name>-<account_id>`. Set `s3_bucket_name` to that full name here and in the import
+block.
+
 Then:
 
 1. **Plan and read it.** `terraform plan` should show *updates* to the bucket, function and rule,
