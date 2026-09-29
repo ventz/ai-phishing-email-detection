@@ -41,3 +41,11 @@ override.tf
 override.tf.json
 *_override.tf
 *_override.tf.json
+*.tfvars.json
+*.auto.tfvars
+*.auto.tfvars.json
+crash.*.log
+.terraformrc
+terraform.rc
+lambda_package/
+*$py.class
