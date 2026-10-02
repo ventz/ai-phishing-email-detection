@@ -9,7 +9,10 @@ requires-python = ">=3.13"
 dependencies = [
     "anthropic[bedrock]>=1.9,<2",
     "boto3>=1.40",
+    "pillow>=12,<13",
     "pydantic>=2.11,<3",
+    "pypdf>=6.19,<7",
+    "zxing-cpp>=3.1,<4",
 ]
 
 [project.scripts]

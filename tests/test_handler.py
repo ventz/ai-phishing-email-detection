@@ -221,3 +221,15 @@ def test_issue_body_has_no_email_text(cfg):
     email = parse_email(forward_as_attachment(phish()))
     body = handler._issue_body("k1", email, None, handler.Route("soc@example.org", "why", True))
     assert "Verify within 24 hours" not in body and "198.51.100.7" in body and "`k1`" in body
+
+
+def test_unroutable_sender_is_dropped_before_attachments_are_opened(monkeypatch, cfg, fakes):
+    monkeypatch.setattr(handler, "_settings", cfg)
+    monkeypatch.setattr(services, "fetch_email", lambda b, k, m: forward_inline(auth=None))
+
+    def must_not_parse(*a, **k):
+        raise AssertionError("full parse ran for an unroutable sender")
+
+    monkeypatch.setattr(handler, "parse_email", must_not_parse)
+    assert "dropped" in handler.lambda_handler(event(), None)["body"]
+    assert fakes == []

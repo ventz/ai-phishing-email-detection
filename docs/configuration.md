@@ -25,7 +25,7 @@ environment variables yourself if you deploy without Terraform or run the CLI lo
 | `receipt_rule_name` | `phishing` | Name of the rule this stack owns |
 | `create_receipt_rule_set` | `false` | Create and activate the rule set (fresh accounts only) |
 | `email_retention_days` | `90` | S3 expiry for raw emails. `0` keeps them forever. A new expiry also applies to existing objects |
-| `lambda_memory_mb` | `512` | |
+| `lambda_memory_mb` | `1024` | Also doubles CPU. Attachment parsing (PDFs, images) assumes at least this much |
 | `lambda_timeout_seconds` | `180` | 90–900. The model call is fitted inside it |
 | `lambda_reserved_concurrency` | `5` | Caps parallel analyses and Bedrock spend. `-1` means unlimited |
 | `log_retention_days` | `30` | |

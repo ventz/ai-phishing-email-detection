@@ -14,7 +14,9 @@ from email.message import EmailMessage
 from email.utils import getaddresses
 from html.parser import HTMLParser
 from typing import ClassVar
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
+
+from . import extractors, urls
 
 MAX_PARTS = 200
 MAX_DEPTH = 20
@@ -88,6 +90,8 @@ _QUOTED = re.compile(r'"(?:[^"\\]|\\.)*"')
 class Link:
     href: str
     text: str
+    via: str = ""
+    """Security gateways peeled off to reach href (e.g. "Proofpoint URL Defense")."""
 
 
 @dataclass(frozen=True)
@@ -152,6 +156,19 @@ class ParsedEmail:
     secondary_text: str = ""
     """Other candidate text (inline text next to an attached original, or a long note above a marker)."""
 
+    attachment_text: str = ""
+    """Text read out of attachments (PDFs), labeled per file."""
+
+    upstream_verdict: str | None = None
+    """What the recipient's own mail filter (Microsoft 365) flagged: "malware", "high-confidence
+    phishing", "phishing", "impersonation", "spoof" or "spam". None when it flagged nothing."""
+
+    lookalikes: list[tuple[str, str, str]] = field(default_factory=list)
+    """(host, brand, how) for link or sender hosts imitating a brand; see urls.lookalike_brand."""
+
+    risky_links: list[str] = field(default_factory=list)
+    """Every link (before the display cap) to a raw IP or internationalized host."""
+
     outer_message_id: str | None = None
     """Message-ID of the forward itself, used to thread the reply."""
 
@@ -164,6 +181,8 @@ class ParsedEmail:
             )
         if self.forward_kind == "inline":
             lines.append("Note: inline forward, so the original's transport headers were not preserved.")
+        if self.upstream_verdict:
+            lines.append(f"Recipient's mail filter (Microsoft 365) flagged the original as: {self.upstream_verdict}")
         lines.append("")
         lines.append("## Headers")
         for name, value in self.headers.items():
@@ -174,7 +193,8 @@ class ParsedEmail:
         lines.append(f"## Links ({len(self.links)})")
         for link in self.links:
             shown = link.text if link.text and link.text != link.href else "(same as URL)"
-            lines.append(f"- text: {shown} | href: {link.href}")
+            via = f" | unwrapped from {link.via}" if link.via else ""
+            lines.append(f"- text: {shown} | href: {link.href}{via}")
         lines.append("")
         lines.append(f"## Attachments ({len(self.attachments)})")
         for a in self.attachments:
@@ -186,6 +206,10 @@ class ParsedEmail:
             lines.append("")
             lines.append("## Other text in the forward (secondary evidence)")
             lines.append(self.secondary_text)
+        if self.attachment_text:
+            lines.append("")
+            lines.append("## Text extracted from attachments")
+            lines.append(self.attachment_text)
         if self.hidden_text:
             lines.append("")
             lines.append("## Hidden text (present in the email but not visible to the reader)")
@@ -254,6 +278,7 @@ class _HTMLText(HTMLParser):
         self.text: list[str] = []
         self.hidden: list[str] = []
         self.links: list[Link] = []
+        self.data_images: list[str] = []
         self._skip = 0
         self._in_title = False
         self._stack: list[str] = []
@@ -294,6 +319,9 @@ class _HTMLText(HTMLParser):
         elif tag == "img":
             if a.get("alt"):
                 self.handle_data(f"[image: {a['alt']}]")
+            src = (a.get("src") or "").strip()
+            if src[:5].lower() == "data:" and len(self.data_images) < extractors.MAX_DATA_URI_IMAGES:
+                self.data_images.append(src)
         else:
             target = {"form": a.get("action"), "area": a.get("href"), "base": a.get("href")}.get(tag)
             if tag == "meta" and (a.get("http-equiv") or "").lower() == "refresh":
@@ -485,15 +513,23 @@ class _Body:
     """Material omissions (body or attachment content): forbid a "safe" verdict."""
     notes: list[str] = field(default_factory=list)
     """Minor omissions (link list, URL length): shown to the model only."""
+    qr: list[Link] = field(default_factory=list)
+    """Links decoded from QR codes (highest priority: the reader can't hover over them)."""
+    pdf_links: list[Link] = field(default_factory=list)
+    data_images: list[str] = field(default_factory=list)
+    seen_files: set[str] = field(default_factory=set)
+    budget: extractors.Budget | None = None
 
 
-def _html_text(content: str) -> tuple[str, str, list[Link]]:
+def _html_text(content: str, sink: _Body | None = None) -> tuple[str, str, list[Link]]:
     parser = _HTMLText()
     try:
         parser.feed(content)
         parser.close()
     except Exception:  # noqa: S110 - keep whatever text was parsed before the error
         pass
+    if sink is not None:
+        sink.data_images += parser.data_images
     visible, hidden = _clean_text("".join(parser.text)), _clean_text("".join(parser.hidden))
     if not visible and hidden:
         # Everything "hidden" means our heuristic misread the markup; never lose the content.
@@ -515,7 +551,7 @@ def extract_body(msg: EmailMessage) -> _Body:
             break
         ctype = part.get_content_type()
         if ctype == "text/html":
-            text, hidden, found = _html_text(_decode(part))
+            text, hidden, found = _html_text(_decode(part), out)
             html_texts.append(text)
             hidden_texts.append(hidden)
             out.links.extend(found)
@@ -556,24 +592,29 @@ def extract_body(msg: EmailMessage) -> _Body:
     return out
 
 
-def _dedupe_links(links: list[Link], notes: list[str]) -> list[Link]:
-    """Dedupe by href (keeping the most informative anchor text), cap URL length, then cap count."""
+def _dedupe(links: list[Link]) -> list[Link]:
+    """Dedupe by href in first-seen order, keeping the most informative anchor text and gateway."""
     by_href: dict[str, Link] = {}
-    long_urls = 0
     for link in links:
-        href = link.href
+        href = urls.clean_href(link.href)
         if len(href) > MAX_HREF_CHARS:
-            href, long_urls = href[:MAX_HREF_CHARS] + "...", long_urls + 1
-        text = link.text[:300]
+            href = href[:MAX_HREF_CHARS] + "..."
+        text = re.sub(r"[\x00-\x1f\x7f\u2028\u2029]+", " ", link.text)[:300]
         kept = by_href.get(href)
-        if kept is None or (kept.text in ("", href) and text not in ("", href)):
-            by_href[href] = Link(href, text)
+        if kept is None:
+            by_href[href] = Link(href, text, link.via)
+        elif kept.text in ("", href) and text not in ("", href):
+            by_href[href] = Link(href, text, kept.via or link.via)
+    return list(by_href.values())
+
+
+def _dedupe_links(links: list[Link], notes: list[str]) -> list[Link]:
+    """Dedupe, then cap the count (used for the per-part link lists)."""
+    unique = _dedupe(links)
+    long_urls = sum(link.href.endswith("...") for link in unique)
     if long_urls:
         notes.append(f"{long_urls} URL(s) longer than {MAX_HREF_CHARS} characters were cut")
-    unique = list(by_href.values())
-    if len(unique) > MAX_LINKS:
-        notes.append(f"{len(unique) - MAX_LINKS} of {len(unique)} distinct links not shown")
-    return unique[:MAX_LINKS]
+    return unique
 
 
 def _attachment_parts(msg: EmailMessage, depth: int = 0):
@@ -593,7 +634,24 @@ def _attachment_parts(msg: EmailMessage, depth: int = 0):
 _SAFE_OPAQUE_EXT = re.compile(r"\.(?:png|jpe?g|gif|bmp|webp|heic|tiff?|txt|csv|vcf|ics|json|xml|log)$", re.IGNORECASE)
 
 
-def extract_attachments(msg: EmailMessage, dropped: list[str]) -> tuple[list[Attachment], list[str]]:
+def _image_parts(msg: EmailMessage, depth: int = 0):
+    """Image leaves (inline or attached), without looking inside attached emails."""
+    if depth > MAX_DEPTH:
+        return
+    for part in msg.iter_parts() if msg.is_multipart() else []:
+        if part.get_content_maintype() == "message":
+            continue
+        if part.is_multipart():
+            yield from _image_parts(part, depth + 1)
+        elif part.get_content_maintype() == "image":
+            yield part
+
+
+def extract_attachments(
+    msg: EmailMessage, dropped: list[str], content: _Body | None = None
+) -> tuple[list[Attachment], list[str]]:
+    """List attachments with hashes. When ``content`` is given, also read what we can out of them:
+    PDF text, links and embedded images, and QR codes in any image (attached or inline)."""
     found: list[Attachment] = []
     uninspectable: list[str] = []
     attachments = list(_attachment_parts(msg))
@@ -611,10 +669,42 @@ def extract_attachments(msg: EmailMessage, dropped: list[str]) -> tuple[list[Att
         found.append(
             Attachment(filename=name, content_type=ctype, size=len(data), sha256=hashlib.sha256(data).hexdigest())
         )
+        # Readers accept leading junk before the header, so look in the first KB, not just byte 0.
+        is_pdf = ctype == "application/pdf" or name.lower().endswith(".pdf") or b"%PDF-" in data[:1024]
+        if is_pdf and content is not None:
+            digest = found[-1].sha256
+            if digest in content.seen_files:
+                continue  # same PDF on the forward and the attached original: read once
+            content.seen_files.add(digest)
+            pdf = extractors.pdf_evidence(data, content.budget)
+            content.notes += [f"PDF {name}: {note}" for note in pdf.notes]
+            dropped += [f"PDF {name}: {item}" for item in pdf.dropped]
+            if pdf.active:
+                # JavaScript, embedded files, launch/submit actions: we read the text, not these.
+                uninspectable.append(f"{name} ({ctype}; contains {', '.join(pdf.active[:3])})")
+            if pdf.inspected:
+                content.text += f"\n\n[PDF attachment: {name}]\n{pdf.text}"
+                content.pdf_links += [Link(u, f"[link in PDF {name}]") for u in pdf.links]
+                content.qr += [Link(q, f"[QR code in PDF {name}]") for q in pdf.qr_payloads]
+                continue  # read (any active content was already listed as uninspectable)
+            uninspectable.append(f"{name} ({ctype})")  # a PDF we could not read, whatever its name
+            continue
         opaque = ctype == "application/octet-stream" and not _SAFE_OPAQUE_EXT.search(name)
         unreadable = _UNINSPECTABLE_EXT.search(name) or ctype.startswith(_UNINSPECTABLE_TYPES) or opaque
         if unreadable and not _HTML_ATTACHMENT.search(name):  # HTML/SVG attachments are read as text
             uninspectable.append(f"{name} ({ctype})")
+
+    if content is not None:
+        for i, part in enumerate(_image_parts(msg)):
+            if i >= extractors.MAX_QR_IMAGES:
+                content.notes.append(f"only the first {extractors.MAX_QR_IMAGES} images were checked for QR codes")
+                break
+            try:
+                data = part.get_payload(decode=True) or b""
+            except Exception:  # noqa: S112 - undecodable image: nothing to scan
+                continue
+            label = _squash(part.get_filename() or part.get("Content-ID") or "inline image")[:120]
+            content.qr += [Link(q, f"[QR code in image {label}]") for q in extractors.decode_qr(data, content.budget)]
     return found, uninspectable
 
 
@@ -651,7 +741,7 @@ def _inline_identity(text: str) -> tuple[str | None, str | None]:
     return addr, _inline_subject(head)
 
 
-def parse_email(raw: bytes, *, max_body_chars: int = 60_000) -> ParsedEmail:
+def parse_email(raw: bytes, *, max_body_chars: int = 60_000, attachment_seconds: float = 30.0) -> ParsedEmail:
     outer: EmailMessage = message_from_bytes(raw, policy=policy.default)  # type: ignore[assignment]
     # Exactly one From header holding exactly one address, validated at full length (not truncated).
     from_headers = outer.get_all("From", [])
@@ -667,6 +757,7 @@ def parse_email(raw: bytes, *, max_body_chars: int = 60_000) -> ParsedEmail:
     original = find_forwarded_original(outer)
     secondary = ""
     ambiguous = False
+    content = _Body(budget=extractors.new_budget(attachment_seconds))  # PDF text/links, QR codes
 
     if original is not None:
         # An attached original carries real headers, so it is the primary evidence. Inline text in
@@ -676,7 +767,7 @@ def parse_email(raw: bytes, *, max_body_chars: int = 60_000) -> ParsedEmail:
         dropped += extracted.dropped
         notes.extend(extracted.notes)
         body, links, hidden = extracted.text, extracted.links, extracted.hidden
-        attachments, uninspectable = extract_attachments(original, dropped)
+        attachments, uninspectable = extract_attachments(original, dropped, content)
         source = original
         if split:
             # Both an inline forward and an attached email. Mail clients re-attach a phish's own
@@ -688,7 +779,7 @@ def parse_email(raw: bytes, *, max_body_chars: int = 60_000) -> ParsedEmail:
             ambiguous = True
             notes.append("The forward contains both inline forwarded text and an attached email; both are shown.")
             links = _dedupe_links(links + outer_extract.links, notes)
-            outer_files, outer_unins = extract_attachments(outer, dropped)
+            outer_files, outer_unins = extract_attachments(outer, dropped, content)
             attachments += [a for a in outer_files if a not in attachments]
             uninspectable += [u for u in outer_unins if u not in uninspectable]
     elif split:
@@ -707,16 +798,51 @@ def parse_email(raw: bytes, *, max_body_chars: int = 60_000) -> ParsedEmail:
 
         links = [link for link in outer_extract.links if _belongs(link)] or outer_extract.links
         hidden = outer_extract.hidden
-        attachments, uninspectable = extract_attachments(outer, dropped)
+        attachments, uninspectable = extract_attachments(outer, dropped, content)
         source = outer
         if len(above) > 300:
             secondary = f"[text above the forward marker, usually the forwarder's own note]\n{above}"
     else:
         kind = "none"
         body, links, hidden = outer_extract.text, outer_extract.links, outer_extract.hidden
-        attachments, uninspectable = extract_attachments(outer, dropped)
+        attachments, uninspectable = extract_attachments(outer, dropped, content)
         source = outer
         notes.append("No forwarded message found; analyzing the email exactly as received.")
+
+    # QR codes in inline data: images (a trick to dodge attachment-based QR scanning).
+    for i, src in enumerate(outer_extract.data_images + (extracted.data_images if original is not None else [])):
+        if i >= extractors.MAX_DATA_URI_IMAGES:
+            break
+        if data := extractors.data_uri_image(src):
+            content.qr += [Link(q, "[QR code in embedded image]") for q in extractors.decode_qr(data, content.budget)]
+
+    if content.budget and content.budget.exhausted:
+        dropped.append("some attachments were not fully read (" + "; ".join(content.budget.exhausted) + ")")
+    notes.extend(content.notes)
+    attachment_text = content.text.strip()
+    if len(attachment_text) > MAX_SECONDARY_CHARS:
+        attachment_text = attachment_text[:MAX_SECONDARY_CHARS]
+        dropped.append(f"attachment text cut to {MAX_SECONDARY_CHARS} characters")
+
+    # Priority order: QR codes, the email's own links, then links inside PDFs. Unwrap gateways,
+    # dedupe, and run the host checks on the FULL list before capping what the model is shown.
+    all_links = _dedupe([_unwrapped(link) for link in content.qr + links + content.pdf_links])
+    risky_links = [link.href for link in all_links if urls.host_is_risky(link.href)]
+    lookalikes: list[tuple[str, str, str]] = []
+    for link in all_links:
+        try:
+            host = urlsplit(link.href).hostname or ""
+        except ValueError:
+            continue
+        hit = urls.lookalike_brand(host)
+        if hit and (host, *hit) not in lookalikes:
+            lookalikes.append((host, *hit))
+    if len(all_links) > MAX_LINKS:
+        cut = all_links[MAX_LINKS:]
+        message = f"{len(cut)} of {len(all_links)} distinct links not shown"
+        (notes if all(link.text.startswith("[link in PDF") for link in cut) else dropped).append(message)
+    links = all_links[:MAX_LINKS]
+    upstream = _microsoft_verdict(source) if kind == "attachment" else None
 
     headers: dict[str, str] = {}
     if kind != "inline":
@@ -733,6 +859,25 @@ def parse_email(raw: bytes, *, max_body_chars: int = 60_000) -> ParsedEmail:
                 "(as written in the forwarded email, unverified) " + headers["Authentication-Results"]
             )
     received = [] if kind == "inline" else [_squash(str(v))[:300] for v in source.get_all("Received", [])[:6]]
+
+    # The sender's own domains are the most common place for a lookalike.
+    for name in ("From", "Reply-To", "Return-Path", "Sender"):
+        address = _single_address(headers.get(name)) if kind != "inline" else None
+        if name == "From" and kind == "inline":
+            address = _inline_identity(body)[0]
+        host = (address or "").rpartition("@")[2]
+        hit = urls.lookalike_brand(host) if host else None
+        if hit and (host, *hit) not in lookalikes:
+            lookalikes.append((host, *hit))
+    if lookalikes:
+        notes.append(
+            "Domains resembling a brand: "
+            + "; ".join(
+                f"{h} ({'imitates' if how == 'lookalike' else 'contains the name'} "
+                f"{urls.DISPLAY_NAMES.get(brand, brand)})"
+                for h, brand, how in lookalikes[:8]
+            )
+        )
 
     subject = (
         (_header(source, "Subject") if kind != "inline" else None)
@@ -757,6 +902,11 @@ def parse_email(raw: bytes, *, max_body_chars: int = 60_000) -> ParsedEmail:
     markers = [f"hidden: {m.group(0)}" for m in INJECTION_PHRASES.finditer(normalize_for_matching(hidden))]
     if kind != "none":
         markers += [f"visible: {m.group(0)}" for m in INJECTION_PHRASES.finditer(normalize_for_matching(body))]
+    markers += [
+        f"attachment: {m.group(0)}" for m in INJECTION_PHRASES.finditer(normalize_for_matching(attachment_text))
+    ]
+    link_text = "\n".join(f"{link.text} {unquote(link.href)}" for link in links)  # incl. QR payloads
+    markers += [f"link: {m.group(0)}" for m in INJECTION_PHRASES.finditer(normalize_for_matching(link_text))]
     mismatches = link_text_mismatches(links)
     if mismatches:
         notes.append("Links whose visible text names a different domain than they go to: " + "; ".join(mismatches))
@@ -783,6 +933,10 @@ def parse_email(raw: bytes, *, max_body_chars: int = 60_000) -> ParsedEmail:
         uninspectable=uninspectable,
         ambiguous_original=ambiguous,
         secondary_text=secondary,
+        attachment_text=attachment_text,
+        upstream_verdict=upstream,
+        lookalikes=lookalikes,
+        risky_links=risky_links,
         outer_message_id=_header(outer, "Message-ID"),
     )
 
@@ -814,6 +968,57 @@ def link_text_mismatches(links: list[Link], limit: int = 5) -> list[str]:
         if len(found) >= limit:
             break
     return found
+
+
+def _unwrapped(link: Link) -> Link:
+    """Replace a security-gateway wrapper with the real destination, saying what was peeled off."""
+    dest, wrappers = urls.unwrap(link.href)
+    if not wrappers:
+        return link
+    return Link(urls.clean_href(dest)[:MAX_HREF_CHARS], link.text, ", ".join(dict.fromkeys(wrappers)))
+
+
+_FOREFRONT_CAT = re.compile(r"\bCAT:([A-Z]+)")
+_FOREFRONT_SFV = re.compile(r"\bSFV:([A-Z]+)")
+
+
+def _microsoft_verdict(msg: EmailMessage) -> str | None:
+    """Microsoft 365's verdict stamped on the original when it was delivered to the reporter.
+
+    Only read when exactly one header of each kind exists (an attacker could add their own). Even
+    then it is only used to raise our verdict, so a forged "clean" changes nothing.
+    """
+    reports = msg.get_all("X-Forefront-Antispam-Report", [])
+    scls = msg.get_all("X-MS-Exchange-Organization-SCL", [])
+    if len(reports) > 1 or len(scls) > 1 or not (reports or scls):
+        return None
+    report = str(reports[0]) if reports else ""
+    cat = (m.group(1) if (m := _FOREFRONT_CAT.search(report)) else "").upper()
+    sfv = (m.group(1) if (m := _FOREFRONT_SFV.search(report)) else "").upper()
+    try:
+        scl = int(str(scls[0]).strip()) if scls else None
+    except ValueError:
+        scl = None
+    if cat in {"MALW", "AMP", "SAP"}:
+        return "malware"
+    if cat == "HPHSH":
+        return "high-confidence phishing"
+    if cat in {"PHSH", "INTOS"}:
+        return "phishing"
+    if cat in {"GIMP", "UIMP", "DIMP"}:
+        return "impersonation"
+    if cat == "SPOOF":
+        return "spoof"
+    if cat in {"HSPM", "SPM", "BULK"} or sfv in {"SPM", "SKS", "SKB"} or (scl is not None and scl >= 5):
+        return "spam"
+    # "Not flagged" is NOT reported: nearly every reported phish got past the filter, so a clean
+    # verdict carries no information and would only bias the model toward "safe".
+    return None
+
+
+def route_headers(raw: bytes) -> ParsedEmail:
+    """Headers-only view used to decide routing before any attachment is opened."""
+    return parse_headers(raw)
 
 
 def parse_headers(raw: bytes) -> ParsedEmail:

@@ -262,8 +262,8 @@ def test_link_cap_and_dedupe_are_recorded():
     links = "".join(f"<a href='https://example.org/{i}'>l</a>" for i in range(160))
     email = parse_email(_html_email(links + "<a href='https://example.org/1'>dup</a>"))
     assert len(email.links) == 150
-    # A long link list is a note for the model, not "evidence dropped" (it must not force SUSPICIOUS).
-    assert any("distinct links not shown" in n for n in email.notes) and email.evidence_dropped == []
+    # The email's own links being cut is real evidence loss (a PDF's links being cut is not).
+    assert any("distinct links not shown" in d for d in email.evidence_dropped)
 
 
 def test_uninspectable_attachments_are_listed():

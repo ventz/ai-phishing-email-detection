@@ -18,7 +18,23 @@
    - identity headers: From, Reply-To, Return-Path, DKIM signing domain, and the original's
      Authentication-Results;
    - links as (anchor text, real href) pairs, including form actions and meta refreshes;
-   - attachments with their SHA-256 hashes, plus the text of any HTML attachments;
+   - attachments with their SHA-256 hashes, the text of HTML attachments, and PDF text, links and
+     embedded images (`extractors.py`, pypdf);
+   - QR codes decoded from attached or inline images and PDF images (zxing-cpp), added as links
+     labeled `[QR code in …]`;
+   - links unwrapped offline from Proofpoint URL Defense (v1–v3), Microsoft Safe Links and Google
+     redirects to the real destination, and checked for lookalike brand domains (`urls.py`);
+   - the recipient's Microsoft 365 *flag* (`X-Forefront-Antispam-Report`,
+     `X-MS-Exchange-Organization-SCL`) on an attached original, read only when at most one of each
+     header exists. "Not flagged" is never shown to the model: nearly every reported phish got past
+     the filter, so it carries no information;
+   - PDF active content (JavaScript, open actions, embedded files, launch/submit actions, XFA)
+     marks the PDF uninspectable even when its text was read.
+
+   Attachment reading runs under a per-email budget: at most 5 PDFs, 40 pages, 25 image decodes
+   and 30 seconds, with pypdf's decompression limits lowered and Pillow restricted to PNG, JPEG,
+   GIF, BMP and WebP. Anything left unread is recorded as omitted evidence. Routing runs on the
+   headers alone *before* this step, so a sender we won't answer never gets an attachment opened.
    - the visible text from **every** inline HTML and plain part.
 
    Size is capped, and truncation is flagged to the model.
@@ -39,8 +55,9 @@
    prompt (cached) and a `record_verdict` tool. The tool's input is validated against a Pydantic
    schema, and the model gets one re-prompt if it doesn't call the tool.
 7. **Guardrails** (`guardrails.py`). Deterministic rules run after the model and can only raise the
-   verdict. A virus verdict, or hidden text addressed to AI scanners, means phishing. A raw-IP or
-   punycode link, a risky file type, an attachment we can't open (PDF, archive, Office), omitted
+   verdict. A virus verdict, hidden text addressed to AI scanners, or Microsoft 365 "high
+   confidence phishing" means phishing. A Microsoft 365 phishing/spoof/spam verdict, a typosquat or
+   embedded-brand domain (`paypa1.com`, `chase.com-onlinebanking.com`), a raw-IP or punycode link, a risky file type, an attachment we can't open (PDF, archive, Office), omitted
    evidence, or two different forwarded emails mean at least suspicious. A raised verdict lists
    the automated checks first.
 8. **Render** (`render.py`, pure). The HTML and plain-text replies are built from the verdict. The
@@ -77,6 +94,9 @@
   Lambda role. On Bedrock, `strict` tools and `output_config.format` currently return 400, and
   Opus/Sonnet 5.5 reject forced `tool_choice`. That is why the verdict uses `tool_choice: auto`
   plus validation and a re-prompt.
+- **Offline enrichment only.** URLs are unwrapped and checked locally; nothing is fetched, which would
+  tip off the attacker and burn one-time links. PDF parsing uses pypdf (BSD) rather than PyMuPDF
+  (AGPL); vector-drawn QR codes inside PDFs are therefore not decoded, embedded QR images are.
 - **No `temperature`.** Sampling parameters return 400 on the current models, so variance is
   controlled by the schema and by effort.
 - **S3 trigger kept** (rather than a direct SES Lambda action). SES's verdict headers in the stored

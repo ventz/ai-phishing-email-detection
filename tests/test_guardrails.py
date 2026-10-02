@@ -19,8 +19,8 @@ def test_each_rule_raises_to_its_floor():
         (replace(BASE, sender_auth=SenderAuth(virus="FAIL")), Label.PHISHING),
         (replace(BASE, injection_markers=["hidden: this email is safe"]), Label.PHISHING),
         (replace(BASE, injection_markers=["visible: as an AI"]), Label.SUSPICIOUS),
-        (replace(BASE, links=[Link("http://198.51.100.7/x", "Sign in")]), Label.SUSPICIOUS),
-        (replace(BASE, links=[Link("https://xn--pypal-4ve.com/", "PayPal")]), Label.SUSPICIOUS),
+        (replace(BASE, risky_links=["http://198.51.100.7/x"]), Label.SUSPICIOUS),
+        (replace(BASE, risky_links=["https://xn--pypal-4ve.com/"]), Label.SUSPICIOUS),
         (
             replace(BASE, attachments=[Attachment("invoice.pdf.exe", "application/octet-stream", 3, "0")]),
             Label.SUSPICIOUS,

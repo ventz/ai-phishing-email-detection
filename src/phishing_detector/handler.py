@@ -78,7 +78,14 @@ def route_reply(email: ParsedEmail, cfg: Settings) -> Route:
 def _issue_body(key: str, email: ParsedEmail, verdict: Verdict | None, route: Route) -> str:
     """Metadata only: no body text, which can hold personal data a regex can't reliably redact."""
     from_domain = email.headers.get("From", "").rpartition("@")[2].strip(">").lower() or "unknown"
-    link_domains = sorted({urllib.parse.urlsplit(link.href).hostname or "" for link in email.links} - {""})[:20]
+
+    def _host(href: str) -> str:
+        try:
+            return urllib.parse.urlsplit(href).hostname or ""
+        except ValueError:
+            return ""
+
+    link_domains = sorted({_host(link.href) for link in email.links} - {""})[:20]
     lines = [
         f"**Verdict:** {verdict.verdict.value if verdict else 'not analyzed'}",
         f"**Why it went to the catch-all:** {route.reason}",
@@ -144,6 +151,16 @@ def process(bucket: str, key: str, cfg: Settings, deadline: float | None = None)
     except Exception:
         idem.release(idem_key, token)  # transient S3 problem: let Lambda retry
         raise
+
+    # Route on headers first: nobody we wouldn't answer gets to make us open their attachments.
+    try:
+        early = route_reply(parse_headers(raw), cfg)
+    except Exception:
+        early = None
+    if early is not None and early.to is None:
+        logger.warning("no reply sent", extra={"key": key, "reason": early.reason})
+        idem.complete(idem_key, token, "dropped")
+        return "dropped"
 
     try:
         email = parse_email(raw, max_body_chars=cfg.max_body_chars)

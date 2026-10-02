@@ -48,8 +48,10 @@ access, and adopting an existing deployment.
 - **Structured verdicts**: phishing / suspicious / likely safe, with a confidence level, concrete
   indicators, and "how to spot it" tips. The output is schema-validated, not parsed from free text.
 - **Evidence the model can use**: parses forwards sent as attachments and inline forwards from
-  Gmail and Outlook. It compares HTML link text with the real targets, lists attachments with their
-  SHA-256 hashes, and flags a plain-text part that disagrees with the HTML.
+  Gmail and Outlook. It reads PDF text and links, decodes QR codes in images and PDFs, unwraps
+  Proofpoint/Safe Links/Google redirects to the real destination, flags lookalike domains
+  (`paypa1.com`, `chase.com-onlinebanking.com`), and uses the recipient's own Microsoft 365
+  filter verdict when present. All offline: no attacker URL is ever fetched.
 - **Resistant to prompt injection**: email content is fenced as untrusted data, and text that tries
   to steer the verdict counts against the email.
 - **Safe by default**: deterministic guardrails stop "safe" when evidence is missing or a hard signal
