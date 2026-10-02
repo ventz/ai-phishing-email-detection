@@ -32,14 +32,25 @@
    clause that *starts* with `dmarc=`. Comments and quoted strings are removed first, so an
    envelope sender like `dmarc=pass@attacker` cannot fake a pass.
 
-   Allowed-domain failures (and virus hits) go to the catch-all. Other domains, unauthenticated
-   spam, bounces, auto-replies and mailing-list mail are dropped.
+   An authenticated reporter always gets the answer, even when SES flagged a virus (that verdict
+   goes to the model). Unauthenticated reports from `catch_all_domains` go to the catch-all. Other
+   domains, unauthenticated spam, bounces, auto-replies and mailing-list mail are dropped.
 6. **Classify** (`classifier.py`). This step calls the Bedrock Messages API with a static system
    prompt (cached) and a `record_verdict` tool. The tool's input is validated against a Pydantic
    schema, and the model gets one re-prompt if it doesn't call the tool.
-7. **Render** (`render.py`, pure). The HTML and plain-text replies are built from the verdict.
-   Everything is escaped, and every URL and domain is defanged.
-8. **Send** with SES v2, with the header `Auto-Submitted: auto-replied`.
+7. **Guardrails** (`guardrails.py`). Deterministic rules run after the model and can only raise the
+   verdict. A virus verdict, or hidden text addressed to AI scanners, means phishing. A raw-IP or
+   punycode link, a risky file type, an attachment we can't open (PDF, archive, Office), omitted
+   evidence, or two different forwarded emails mean at least suspicious. A raised verdict lists
+   the automated checks first.
+8. **Render** (`render.py`, pure). The HTML and plain-text replies are built from the verdict. The
+   subject is fixed (`Phishing report result: <VERDICT> (ref …)`) and never echoes the phish. The
+   body names the reporter and time, escapes everything, defangs every URL and domain, removes
+   phone numbers and masks third-party email addresses.
+9. **Send** with SES v2, with `Auto-Submitted: auto-replied` and `In-Reply-To`/`References` set.
+   Outlook and Apple Mail thread the reply under the reporter's forward; Gmail does not, because
+   it also requires a matching subject, and the reply deliberately never repeats the phish's. A "sending" state is recorded first, so an
+   ambiguous send is never repeated.
 
 ## Security model
 
@@ -47,6 +58,9 @@
 |--------|---------|
 | Spoofed `From:` turns the service into a relay or backscatter source | DMARC-pass gate on SES's own verdict (the topmost header only), domain allowlist, and an IAM `ses:FromAddress` condition |
 | A phish talks the model into "clean" | Evidence is fenced as untrusted data, and steering text counts as a phishing signal. A decoy text/plain part is surfaced next to the HTML. The verdict comes from a schema, not keyword matching |
+| Attacker controls what the model sees (unclosed `<head>`, hidden forward markers, decoy parts) | Only script/style/template suppress text; hidden text is captured and labeled, never dropped; markers are read from visible text only; an attached original wins and inline text is kept as secondary evidence |
+| Evidence silently dropped by size caps | Every cap is recorded and shown to the model, and a guardrail forbids "safe" |
+| Reply used as a lure or tripping content filters | Fixed subject `Phishing report result: <VERDICT> (ref …)`, never the phish's subject; the body states who reported it and when; "safe" summaries are templated; phone numbers removed and third-party addresses masked |
 | Failures reported as "clean" | Any classification failure sends **NOT ANALYZED — treat as suspicious** |
 | Model output injects links or HTML into the reply | Everything is HTML-escaped. URLs and domains, including internationalized (IDN) domains, are defanged, and bidirectional and zero-width characters are stripped |
 | Catch-all GitHub issues leak personal data | Issues carry metadata only: verdict, reason, S3 key, sender and link domains, attachment hashes |

@@ -42,6 +42,7 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "emails" {
 }
 
 resource "aws_s3_bucket_lifecycle_configuration" "emails" {
+  count  = var.email_retention_days > 0 ? 1 : 0
   bucket = aws_s3_bucket.emails.id
   rule {
     id     = "expire-emails"
@@ -276,6 +277,7 @@ resource "aws_lambda_function" "this" {
       SES_CONFIG_SET_NAME         = var.ses_configuration_set
       DEFAULT_FORWARDER_CATCH_ALL = var.default_forwarder_catch_all
       ALLOWED_SENDER_DOMAINS      = join(",", var.allowed_sender_domains)
+      CATCH_ALL_DOMAINS           = join(",", var.catch_all_domains)
       REQUIRE_SENDER_AUTH         = tostring(var.require_sender_auth)
       HELP_CONTACT                = var.help_contact
       MODEL_ID                    = var.model_id

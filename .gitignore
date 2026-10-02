@@ -49,3 +49,7 @@ crash.*.log
 terraform.rc
 lambda_package/
 *$py.class
+
+# Temporary import blocks used when adopting an existing deployment
+terraform/imports.tf
+terraform/tfplan

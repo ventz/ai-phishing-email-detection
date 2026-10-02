@@ -13,18 +13,34 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
-from .render import Reply
+from .render import _PHONE, Reply
 
 logger = logging.getLogger(__name__)
 
 _BOTO = Config(retries={"mode": "standard", "max_attempts": 4}, connect_timeout=5, read_timeout=20)
+# Sending is not idempotent: exactly one attempt (botocore would retry a read timeout, which can
+# duplicate a send SES already accepted), and short timeouts keep it inside the deadline.
+_SES = Config(retries={"mode": "standard", "total_max_attempts": 1}, connect_timeout=5, read_timeout=10)
+# Idempotency bookkeeping runs inside the same 30 s reserve as the send.
+_DDB = Config(retries={"mode": "standard", "max_attempts": 3}, connect_timeout=3, read_timeout=5)
 _clients: dict[str, Any] = {}
 
 
 def client(name: str) -> Any:
     if name not in _clients:
-        _clients[name] = boto3.client(name, config=_BOTO)
+        _clients[name] = boto3.client(name, config={"sesv2": _SES, "dynamodb": _DDB}.get(name, _BOTO))
     return _clients[name]
+
+
+_MESSAGE_ID = re.compile(r"<[!-~]{1,250}>")
+
+
+class SendRejected(RuntimeError):
+    """SES refused the message (validation, permissions, throttling): nothing was sent."""
+
+
+class SendUnknown(RuntimeError):
+    """The send request went out but its outcome is unknown; never retried, to avoid duplicates."""
 
 
 class EmailTooLarge(ValueError):
@@ -44,7 +60,9 @@ def fetch_email(bucket: str, key: str, max_bytes: int, head_bytes: int = 256 * 1
     return s3.get_object(Bucket=bucket, Key=key)["Body"].read()
 
 
-def send_reply(reply: Reply, *, sender: str, to: str, configuration_set: str | None) -> str:
+def send_reply(
+    reply: Reply, *, sender: str, to: str, configuration_set: str | None, in_reply_to: str | None = None
+) -> str:
     params: dict[str, Any] = {
         "FromEmailAddress": sender,
         "Destination": {"ToAddresses": [to]},
@@ -56,13 +74,27 @@ def send_reply(reply: Reply, *, sender: str, to: str, configuration_set: str | N
                     "Html": {"Data": reply.html, "Charset": "UTF-8"},
                 },
                 # Mark as an automated reply so well-behaved systems never answer it (no mail loops).
-                "Headers": [{"Name": "Auto-Submitted", "Value": "auto-replied"}],
+                "Headers": [{"Name": "Auto-Submitted", "Value": "auto-replied"}]
+                + (
+                    # Thread the reply under the user's own forward.
+                    [{"Name": "In-Reply-To", "Value": in_reply_to}, {"Name": "References", "Value": in_reply_to}]
+                    # SES header values must be printable ASCII.
+                    if in_reply_to and _MESSAGE_ID.fullmatch(in_reply_to)
+                    else []
+                ),
             }
         },
     }
     if configuration_set:
         params["ConfigurationSetName"] = configuration_set
-    return client("sesv2").send_email(**params)["MessageId"]
+    try:
+        return client("sesv2").send_email(**params)["MessageId"]
+    except ClientError as exc:
+        # A 4xx (validation, permissions, throttling) means SES did not send. A 5xx is ambiguous:
+        # re-raise as-is so the caller treats it as "maybe sent" and never retries.
+        if exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 500) >= 500:
+            raise
+        raise SendRejected(exc.response["Error"].get("Code", "ClientError")) from exc
 
 
 class InFlight(RuntimeError):
@@ -111,7 +143,22 @@ class Idempotency:
             status = exc.response.get("Item", {}).get("status", {}).get("S")
             if status == "in_progress":
                 raise InFlight(f"{key} is being processed by another attempt") from exc
+            if status == "sending":
+                logger.error(
+                    "a previous attempt died while sending; reply outcome unknown, not resending", extra={"key": key}
+                )
             return None
+
+    def mark_sending(self, key: str, token: str) -> None:
+        """Record that a send is about to happen, so a crash after it is never retried blindly."""
+        if not self.table:
+            return
+        cond = self._owned(token)
+        cond["ExpressionAttributeNames"]["#s"] = "status"
+        cond["ExpressionAttributeValues"][":g"] = {"S": "sending"}
+        client("dynamodb").update_item(
+            TableName=self.table, Key={"pk": {"S": key}}, UpdateExpression="SET #s = :g", **cond
+        )
 
     def _owned(self, token: str) -> dict[str, Any]:
         return {
@@ -147,7 +194,7 @@ _PII = [
     (re.compile(r"\b(?:https?://|www\.)\S+", re.IGNORECASE), "[URL]"),
     (re.compile(r"\b(?:\d[ -]?){13,19}\b"), "[CARD]"),
     (re.compile(r"\b\d{3}-\d{2}-\d{4}\b"), "[SSN]"),
-    (re.compile(r"\+?\d[\d ().-]{7,}\d"), "[PHONE]"),
+    (_PHONE, "[PHONE]"),
 ]
 
 

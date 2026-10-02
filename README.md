@@ -52,9 +52,10 @@ access, and adopting an existing deployment.
   SHA-256 hashes, and flags a plain-text part that disagrees with the HTML.
 - **Resistant to prompt injection**: email content is fenced as untrusted data, and text that tries
   to steer the verdict counts against the email.
-- **Safe by default**: a failed analysis never says "safe". Every URL in the reply is defanged
-  (`hxxps://evil[.]example`). Replies go only to DMARC-authenticated forwarders, optionally
-  restricted to your domains.
+- **Safe by default**: deterministic guardrails stop "safe" when evidence is missing or a hard signal
+  fires (malware, hidden instructions to AI scanners, unopenable attachments). A failed analysis
+  never says "safe". Replies use a fixed subject and defang every link
+  (`hxxps://evil[.]example`), and go only to DMARC-authenticated forwarders.
 - **Accessible replies**: meet WCAG 2.2 AA contrast, work in dark mode, always include a
   plain-text part, and state the verdict first.
 - **Hardened AWS setup**: no static keys, and the IAM policy is least-privilege. The S3 bucket is

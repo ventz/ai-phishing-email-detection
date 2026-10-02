@@ -99,7 +99,8 @@ def test_deadline_is_respected(cfg, email):
         classify(email, cfg, client=client, deadline=time.monotonic() + 5)
     assert client.calls == []
     classify(email, cfg, client=client, deadline=time.monotonic() + 185)
-    assert client.options["timeout"] <= 60 and client.options["max_retries"] == 2
+    # Our own retries (SDK retries off), and no single attempt can outlast the deadline.
+    assert client.options["timeout"] <= 180 and client.options["max_retries"] == 0
 
 
 def test_settings_from_env_defaults_and_legacy_names():
