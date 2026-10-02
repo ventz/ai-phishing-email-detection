@@ -150,8 +150,9 @@ variable "bedrock_role_arn" {
 # --- Lambda --------------------------------------------------------------------------------------
 
 variable "lambda_memory_mb" {
-  type    = number
-  default = 512
+  description = "1024 MB also doubles CPU; attachment parsing (PDF, images) assumes at least this much."
+  type        = number
+  default     = 1024
 }
 
 variable "lambda_timeout_seconds" {
