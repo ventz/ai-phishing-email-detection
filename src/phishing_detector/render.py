@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import html
 import re
+import unicodedata
 from dataclasses import dataclass
 
 from .classifier import Label, Verdict
@@ -18,6 +19,19 @@ class Reply:
     subject: str
     html: str
     text: str
+
+
+@dataclass(frozen=True)
+class ReportContext:
+    """Facts about the report itself, shown in the reply so it can't be passed off out of context."""
+
+    original_subject: str
+    forwarder: str | None = None
+    received_at: str | None = None
+    """e.g. "2026-10-02 14:05 UTC"."""
+    ref: str | None = None
+    """Short reference derived from the stored email's key, for support lookups."""
+    help_contact: str | None = None
 
 
 @dataclass(frozen=True)
@@ -69,24 +83,66 @@ def defang(text: str) -> str:
 DEFANG_NOTE = "Links and domains below are written as hxxp:// and [.] on purpose, so they cannot be clicked."
 
 
+_PHONE = re.compile(r"(?<![\w.])(?:\+\d{1,3}[ .-]?)?(?:\(\d{2,4}\) ?|\d{2,4}[ .\-–])\d{3,4}[ .-]\d{3,4}(?!\w|\.\d)")
+_TEL = re.compile(r"\btel:\S+", re.IGNORECASE)
+_PHONE_DIGITS = re.compile(r"(?<![\w.])\+?\d{10,15}(?![\w]|\.\d)")
+_EMAIL = re.compile(r"(?<![\w.+-])([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\.[A-Za-z]{2,})")
+CLEAN_SUMMARY = (
+    "No phishing indicators were found in this email. That is not a guarantee: if anything about it "
+    "feels off, verify it with the sender through a channel you already trust."
+)
+
+
+def neutralize(text: str) -> str:
+    """Remove phone numbers (callback-scam bait) and hide the local part of email addresses (privacy),
+    keeping the domain, which is the useful teaching signal. Normalizes first so zero-width or
+    fullwidth characters can't hide a number from the patterns."""
+    text = _INVISIBLE.sub("", unicodedata.normalize("NFKC", text))
+    text = _TEL.sub("[phone number removed]", text)
+    text = _PHONE.sub("[phone number removed]", text)
+    text = _PHONE_DIGITS.sub("[phone number removed]", text)
+    return _EMAIL.sub(lambda m: f"{m.group(1)}***@{m.group(2)}", text)
+
+
 def _has_defanged(summary: str | None, sections: list[tuple[str, list[str]]]) -> bool:
     texts = [summary or ""] + [item for _, items in sections for item in items]
     return any(defang(t) != t for t in texts)
 
 
 def _safe(text: str) -> str:
-    return html.escape(defang(text), quote=True)
+    """For any text derived from the email or the model."""
+    return html.escape(defang(neutralize(text)), quote=True)
 
 
-def _subject(tag: str, original: str) -> str:
-    original = re.sub(r"[\r\n\t]+", " ", original).strip()
-    return f"[{tag}] {defang(original)}"[:200]
+def _plain(text: str) -> str:
+    return defang(neutralize(text))
+
+
+def _subject(tag: str, ctx: ReportContext) -> str:
+    # Never echo the phish's own subject: it trips content filters and turns our reply into a lure.
+    return f"Phishing report result: {tag}" + (f" (ref {ctx.ref})" if ctx.ref else "")
+
+
+def _report_line(ctx: ReportContext) -> str:
+    subject = re.sub(r"[\r\n\t]+", " ", ctx.original_subject).strip()
+    subject = defang(neutralize(subject[:120] + ("..." if len(subject) > 120 else "")))
+    parts = [f'Your report: "{subject}"']
+    if ctx.forwarder or ctx.received_at:
+        who = f"from {ctx.forwarder}" if ctx.forwarder else ""
+        when = f"on {ctx.received_at}" if ctx.received_at else ""
+        parts.append(f"received {who} {when}".replace("  ", " ").strip())
+    if ctx.ref:
+        parts.append(f"reference {ctx.ref}")
+    return ", ".join(parts) + "."
 
 
 def _page(
-    theme: _Theme, title: str, sections: list[tuple[str, list[str]]], summary: str | None, help_contact: str | None
+    theme: _Theme, title: str, sections: list[tuple[str, list[str]]], summary: str | None, ctx: ReportContext
 ) -> str:
-    parts = []
+    help_contact = ctx.help_contact
+    # The forwarder's address is shown as-is (it's the reader's own); the subject is attacker text.
+    report = html.escape(_report_line(ctx), quote=True)
+    parts = [f'<p class="muted" style="margin:0 0 16px;font-size:14px;color:#555555;">{report}</p>']
     if summary:
         parts.append(f'<p style="margin:0 0 16px;font-size:16px;">{_safe(summary)}</p>')
     if _has_defanged(summary, sections):
@@ -142,16 +198,17 @@ def _page(
 """
 
 
-def _text(theme: _Theme, sections: list[tuple[str, list[str]]], summary: str | None, help_contact: str | None) -> str:
-    out = [theme.heading, "=" * len(theme.heading), theme.action, ""]
+def _text(theme: _Theme, sections: list[tuple[str, list[str]]], summary: str | None, ctx: ReportContext) -> str:
+    help_contact = ctx.help_contact
+    out = [theme.heading, "=" * len(theme.heading), theme.action, "", _report_line(ctx), ""]
     if summary:
-        out += [defang(summary), ""]
+        out += [_plain(summary), ""]
     if _has_defanged(summary, sections):
         out += [DEFANG_NOTE, ""]
     for heading, items in sections:
         if items:
             out.append(f"{heading}:")
-            out += [f"- {defang(item)}" for item in items]
+            out += [f"- {_plain(item)}" for item in items]
             out.append("")
     out.append("This result was produced automatically by an AI model and can be wrong.")
     if help_contact:
@@ -159,21 +216,29 @@ def _text(theme: _Theme, sections: list[tuple[str, list[str]]], summary: str | N
     return "\n".join(out)
 
 
-def render_verdict(verdict: Verdict, original_subject: str, help_contact: str | None = None) -> Reply:
+def render_verdict(verdict: Verdict, ctx: ReportContext) -> Reply:
     theme = _THEMES[verdict.verdict]
     first = "Red flags" if verdict.verdict is not Label.CLEAN else "Why it looks legitimate"
-    sections = [(first, verdict.indicators)]
+    noted = "AI review noted: "
+    flags = [i for i in verdict.indicators if not i.startswith(noted)]
+    ai_points = [i.removeprefix(noted) for i in verdict.indicators if i.startswith(noted)]
+    sections = [(first, flags)]
+    if ai_points:
+        sections.append(("What the AI review saw (before the automated checks)", ai_points))
     if verdict.verdict is not Label.CLEAN:
         sections.append(("How to spot similar emails", verdict.tips))
-    summary = f"{verdict.summary} (Confidence: {verdict.confidence.value}.)"
+    # A "safe" verdict gets a fixed summary: the model's wording is derived from attacker text and
+    # must never read as an endorsement someone could screenshot.
+    summary_text = CLEAN_SUMMARY if verdict.verdict is Label.CLEAN else verdict.summary
+    summary = f"{summary_text} (Confidence: {verdict.confidence.value}.)"
     return Reply(
-        subject=_subject(theme.tag, original_subject),
-        html=_page(theme, theme.heading, sections, summary, help_contact),
-        text=_text(theme, sections, summary, help_contact),
+        subject=_subject(theme.tag, ctx),
+        html=_page(theme, theme.heading, sections, summary, ctx),
+        text=_text(theme, sections, summary, ctx),
     )
 
 
-def render_unavailable(original_subject: str, help_contact: str | None = None, reason: str | None = None) -> Reply:
+def render_unavailable(ctx: ReportContext, reason: str | None = None) -> Reply:
     sections = [
         (
             "What to do",
@@ -184,7 +249,7 @@ def render_unavailable(original_subject: str, help_contact: str | None = None, r
         )
     ]
     return Reply(
-        subject=_subject(_UNAVAILABLE.tag, original_subject),
-        html=_page(_UNAVAILABLE, _UNAVAILABLE.heading, sections, reason, help_contact),
-        text=_text(_UNAVAILABLE, sections, reason, help_contact),
+        subject=_subject(_UNAVAILABLE.tag, ctx),
+        html=_page(_UNAVAILABLE, _UNAVAILABLE.heading, sections, reason, ctx),
+        text=_text(_UNAVAILABLE, sections, reason, ctx),
     )

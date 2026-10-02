@@ -2,19 +2,21 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import time
 import urllib.parse
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
-from . import services
+from . import guardrails, services
 from .classifier import ClassificationError, Verdict, classify
 from .config import Settings
-from .parsing import ParsedEmail, parse_email
-from .render import Reply, defang, render_unavailable, render_verdict
+from .parsing import ParsedEmail, parse_email, parse_headers
+from .render import Reply, ReportContext, defang, render_unavailable, render_verdict
 
 logger = logging.getLogger("phishing_detector")
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
@@ -67,7 +69,8 @@ def route_reply(email: ParsedEmail, cfg: Settings) -> Route:
     problem = "no single valid From address" if not fwd else f"forwarder failed DMARC (dmarc={auth.dmarc})"
     if auth.spam == "FAIL" and not authenticated:
         return Route(None, f"{problem}; SES spam verdict FAIL")
-    if cfg.catch_all:
+    # The catch-all is for our own people whose forward failed authentication, not internet mail.
+    if cfg.catch_all and fwd and _domain_allowed(fwd, cfg.catch_all_domains):
         return Route(cfg.catch_all, problem, catch_all=True)
     return Route(None, problem)
 
@@ -80,10 +83,11 @@ def _issue_body(key: str, email: ParsedEmail, verdict: Verdict | None, route: Ro
         f"**Verdict:** {verdict.verdict.value if verdict else 'not analyzed'}",
         f"**Why it went to the catch-all:** {route.reason}",
         f"**Forward type:** {email.forward_kind}",
-        f"**Original sender domain:** `{defang(from_domain)}`",
+        f"**Original sender domain:** `{services.redact(defang(from_domain)).replace('`', '')}`",
         f"**Stored email:** `{key}`",
         "",
-        "**Link domains:** " + (", ".join(f"`{defang(d)}`" for d in link_domains) or "none"),
+        "**Link domains:** "
+        + (", ".join(f"`{services.redact(defang(d)).replace('`', '')}`" for d in link_domains) or "none"),
         "",
         "**Attachments:**",
         *[
@@ -96,6 +100,33 @@ def _issue_body(key: str, email: ParsedEmail, verdict: Verdict | None, route: Ro
     return "\n".join(lines)
 
 
+def _context(key: str, email: ParsedEmail | None, cfg: Settings, subject: str | None = None) -> ReportContext:
+    return ReportContext(
+        original_subject=subject or (email.subject if email else "(unknown)"),
+        forwarder=email.forwarder if email else None,
+        received_at=datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC"),
+        ref=hashlib.sha256(key.encode()).hexdigest()[:8],
+        help_contact=cfg.help_contact,
+    )
+
+
+def _send(
+    idem: services.Idempotency, idem_key: str, token: str, reply: Reply, to: str, cfg: Settings, in_reply_to: str | None
+) -> str:
+    """Send at most once. After the request leaves, an error means "maybe sent": never retry it."""
+    idem.mark_sending(idem_key, token)
+    try:
+        return services.send_reply(
+            reply, sender=cfg.sender, to=to, configuration_set=cfg.ses_configuration_set, in_reply_to=in_reply_to
+        )
+    except services.SendRejected:
+        raise  # SES refused before sending: safe to retry
+    except Exception as exc:
+        idem.complete(idem_key, token, "send_unknown")
+        logger.error("reply may or may not have been sent; not retrying", extra={"key": idem_key, "error": repr(exc)})
+        raise services.SendUnknown(str(exc)) from exc
+
+
 def process(bucket: str, key: str, cfg: Settings, deadline: float | None = None) -> str:
     idem = services.Idempotency(cfg.idempotency_table, stale_after=cfg.idempotency_stale_seconds)
     idem_key = f"{bucket}/{key}"
@@ -106,27 +137,54 @@ def process(bucket: str, key: str, cfg: Settings, deadline: float | None = None)
 
     try:
         raw = services.fetch_email(bucket, key, cfg.max_email_bytes)
+    except services.EmailTooLarge as exc:
+        return _not_analyzed(
+            exc.head, key, cfg, idem, idem_key, token, "too_large", "The email was too large to analyze automatically."
+        )
+    except Exception:
+        idem.release(idem_key, token)  # transient S3 problem: let Lambda retry
+        raise
+
+    try:
         email = parse_email(raw, max_body_chars=cfg.max_body_chars)
+    except Exception as exc:  # malformed or hostile MIME: retrying won't help
+        logger.warning("email could not be parsed", extra={"key": key, "error": repr(exc)[:300]})
+        return _not_analyzed(
+            raw[: 256 * 1024],
+            key,
+            cfg,
+            idem,
+            idem_key,
+            token,
+            "unparseable",
+            "The email could not be read automatically.",
+        )
+
+    try:
         route = route_reply(email, cfg)
         if route.to is None:
             logger.warning("no reply sent", extra={"key": key, "reason": route.reason})
             idem.complete(idem_key, token, "dropped")
             return "dropped"
 
+        ctx = _context(key, email, cfg)
         verdict: Verdict | None
         try:
             verdict = classify(email, cfg, deadline=deadline)
-            reply: Reply = render_verdict(verdict, email.subject, cfg.help_contact)
+            verdict, raised = guardrails.apply(email, verdict)
+            if raised:
+                logger.info(
+                    "guardrails raised verdict", extra={"key": key, "verdict": verdict.verdict.value, "reasons": raised}
+                )
+            reply: Reply = render_verdict(verdict, ctx)
         except ClassificationError as exc:
             logger.error("classification failed", extra={"key": key, "error": str(exc)})
             verdict = None
-            reply = render_unavailable(email.subject, cfg.help_contact)
+            reply = render_unavailable(ctx)
 
-        message_id = services.send_reply(
-            reply, sender=cfg.sender, to=route.to, configuration_set=cfg.ses_configuration_set
-        )
-    except services.EmailTooLarge as exc:
-        return _too_large(exc, key, cfg, idem, idem_key, token)
+        message_id = _send(idem, idem_key, token, reply, route.to, cfg, email.outer_message_id)
+    except services.SendUnknown:
+        return "send_unknown"
     except Exception:
         idem.release(idem_key, token)  # let the Lambda retry (and then the failure queue) handle it
         raise
@@ -141,34 +199,42 @@ def process(bucket: str, key: str, cfg: Settings, deadline: float | None = None)
         services.open_github_issue(
             repo=cfg.github_repo,
             token_secret_arn=cfg.github_token_secret_arn,
-            title=f"[{outcome}] {email.subject}",
+            title=f"[{outcome}] report {_context(key, email, cfg).ref}",
             body=_issue_body(key, email, verdict, route),
         )
     return outcome
 
 
-def _too_large(exc: services.EmailTooLarge, key: str, cfg: Settings, idem, idem_key: str, token: str) -> str:
-    """Route on the headers alone and tell the reporter it could not be analyzed."""
-    logger.warning("email too large to analyze", extra={"key": key, "error": str(exc)})
+def _not_analyzed(
+    head: bytes, key: str, cfg: Settings, idem, idem_key: str, token: str, outcome: str, reason: str
+) -> str:
+    """Route on the headers alone and tell the reporter the email could not be analyzed. Final:
+    retrying the same bytes would fail the same way."""
     try:
-        email = parse_email(exc.head, max_body_chars=1)
-        route = route_reply(email, cfg)
+        try:
+            email = parse_headers(head)
+        except Exception:
+            email = None
+        route = route_reply(email, cfg) if email else Route(None, "unparseable headers")
         if route.to:
-            reply = render_unavailable(
-                email.subject, cfg.help_contact, reason="The email was too large to analyze automatically."
-            )
-            services.send_reply(reply, sender=cfg.sender, to=route.to, configuration_set=cfg.ses_configuration_set)
+            reply = render_unavailable(_context(key, email, cfg), reason=reason)
+            _send(idem, idem_key, token, reply, route.to, cfg, email.outer_message_id if email else None)
+        else:
+            logger.warning("no reply sent", extra={"key": key, "reason": route.reason})
+    except services.SendUnknown:
+        return "send_unknown"
     except Exception:
         idem.release(idem_key, token)
         raise
-    idem.complete(idem_key, token, "too_large")
-    return "too_large"
+    idem.complete(idem_key, token, outcome)
+    return outcome
 
 
 def _deadline(context: Any) -> float | None:
     """Monotonic time by which the model call must finish, leaving room to send the reply."""
     remaining_ms = getattr(context, "get_remaining_time_in_millis", None)
-    return time.monotonic() + remaining_ms() / 1000 - 15 if remaining_ms else None
+    # Leave 30 s to render and send the reply (SES client: 10 s read timeout, 2 attempts).
+    return time.monotonic() + remaining_ms() / 1000 - 30 if remaining_ms else None
 
 
 def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:

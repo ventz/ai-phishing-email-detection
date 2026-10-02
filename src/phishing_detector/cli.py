@@ -20,10 +20,11 @@ from datetime import UTC, datetime
 
 import boto3
 
+from . import guardrails
 from .classifier import ClassificationError, classify
 from .config import Settings
 from .parsing import parse_email
-from .render import render_unavailable, render_verdict
+from .render import ReportContext, render_unavailable, render_verdict
 
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 
@@ -63,10 +64,11 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     email = parse_email(_raw(args.bucket, args.key))
     try:
         verdict = classify(email, _settings(args))
-        reply = render_verdict(verdict, email.subject)
+        verdict, _ = guardrails.apply(email, verdict)
+        reply = render_verdict(verdict, ReportContext(email.subject, email.forwarder, ref="local"))
     except ClassificationError as exc:
         print(f"Classification failed: {exc}", file=sys.stderr)
-        reply = render_unavailable(email.subject)
+        reply = render_unavailable(ReportContext(email.subject, email.forwarder, ref="local"))
     print(f"Subject: {_safe(reply.subject)}\n\n{_safe(reply.text)}")
     if args.html:
         with open(args.html, "w", encoding="utf-8") as fh:

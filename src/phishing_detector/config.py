@@ -73,6 +73,10 @@ class Settings:
     catch_all: str | None = None
     """Internal mailbox that gets the report when the forwarder can't be trusted or determined."""
 
+    catch_all_domains: frozenset[str] = field(default_factory=frozenset)
+    """Forwarder domains whose failed reports may go to the catch-all. Defaults to the allowlist,
+    or to the receiver's base domain (example.org for phishing@mail.example.org)."""
+
     idempotency_table: str | None = None
     idempotency_stale_seconds: int = 300
     """Just above the Lambda timeout: an older in-progress claim belonged to a killed attempt."""
@@ -125,6 +129,12 @@ class Settings:
                 ", ".join(retired),
             )
 
+        allowed = _csv(get("ALLOWED_SENDER_DOMAINS"))
+        catch_all_domains = (
+            _csv(get("CATCH_ALL_DOMAINS"))
+            or allowed
+            or frozenset({".".join(receiver.lower().rpartition("@")[2].split(".")[-2:])})
+        )
         return cls(
             sender=sender.lower(),
             receiver=receiver.lower(),
@@ -135,7 +145,8 @@ class Settings:
             bedrock_role_arn=get("BEDROCK_ROLE_ARN"),
             ses_configuration_set=get("SES_CONFIG_SET_NAME"),
             help_contact=get("HELP_CONTACT"),
-            allowed_sender_domains=_csv(get("ALLOWED_SENDER_DOMAINS")),
+            allowed_sender_domains=allowed,
+            catch_all_domains=catch_all_domains,
             require_sender_auth=_bool(get("REQUIRE_SENDER_AUTH"), True),
             catch_all=(get("DEFAULT_FORWARDER_CATCH_ALL") or "").lower() or None,
             idempotency_table=get("IDEMPOTENCY_TABLE"),

@@ -7,18 +7,60 @@ from __future__ import annotations
 
 import hashlib
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from email import message_from_bytes, policy
 from email.message import EmailMessage
 from email.utils import getaddresses
 from html.parser import HTMLParser
 from typing import ClassVar
+from urllib.parse import urlsplit
 
 MAX_PARTS = 200
-MAX_LINKS = 60
+MAX_DEPTH = 20
+MAX_LINKS = 150
+MAX_HREF_CHARS = 2_000
 MAX_ATTACHMENTS = 20
+MAX_HTML_ATTACHMENT_CHARS = 30_000
+MAX_HIDDEN_CHARS = 5_000
+MAX_SECONDARY_CHARS = 15_000
 MAX_HEADER_CHARS = 1_000
+MAX_FROM_CHARS = 2_000
 DEFAULT_SUBJECT = "(no subject)"
+
+# Attachment types we cannot open; their presence means the email can't be called safe.
+_UNINSPECTABLE_EXT = re.compile(
+    r"\.(?:pdf|zip|7z|rar|gz|tgz|tar|bz2|xz|cab|docx?|xlsx?|pptx?|docm|xlsm|pptm|odt|ods|odp|rtf|"
+    r"iso|img|vhdx?|lnk|one|msg|eml\.zip)$",
+    re.IGNORECASE,
+)
+_UNINSPECTABLE_TYPES = (
+    "application/pdf",
+    "application/zip",
+    "application/x-7z",
+    "application/x-rar",
+    "application/vnd.ms-",
+    "application/vnd.openxmlformats",
+    "application/msword",
+    "application/x-iso9660",
+)
+# Inline styles that hide text from the reader (hidden "preheader" text and anti-AI-scanner tricks).
+_HIDDEN_STYLE = re.compile(
+    r"display\s*:\s*none|visibility\s*:\s*hidden|font-size\s*:\s*0(?:\.0+)?(?:px|pt|em|rem|%)?\s*(?:;|!|$)"
+    r"|opacity\s*:\s*0(?:\.0+)?\s*(?:;|!|$)|max-height\s*:\s*0(?:px)?\s*(?:;|!|$)",
+    re.IGNORECASE,
+)
+# Phrases aimed at an AI reader rather than a person.
+INJECTION_PHRASES = re.compile(
+    r"ignore (?:all |any |the )?(?:previous|prior|above|earlier) (?:instructions|prompts?|rules)"
+    r"|(?:classify|mark|treat|label|consider|report) (?:this|it|the (?:e-?mail|message)) as "
+    r"(?:safe|clean|legitimate|benign|harmless|not (?:phishing|spam|malicious))"
+    r"|this (?:e-?mail|message) is (?:safe|legitimate|benign|not (?:phishing|spam|malicious))"
+    r"|do(?: not|n'?t) (?:flag|report|block) (?:this|it)"
+    r"|(?:you are|you're) an? (?:ai|automated) (?:assistant|scanner|classifier|filter|model)",
+    re.IGNORECASE,
+)
+INVISIBLE_CHARS = re.compile("[\u00ad\u061c\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u206f\ufeff]")
 
 # Inline-forward separators written by Gmail, Outlook, Apple Mail and Thunderbird.
 _FORWARD_MARKER = re.compile(
@@ -92,6 +134,26 @@ class ParsedEmail:
     """The outer message is an auto-reply/bounce (RFC 3834); never answer it."""
 
     notes: list[str] = field(default_factory=list)
+    hidden_text: str = ""
+    """Text in the original that the reader cannot see (display:none, zero size, ...)."""
+
+    injection_markers: list[str] = field(default_factory=list)
+    """Phrases aimed at an AI reader, prefixed "hidden:" or "visible:"."""
+
+    evidence_dropped: list[str] = field(default_factory=list)
+    """Every cap that discarded evidence. Non-empty means the analysis saw only part of the email."""
+
+    uninspectable: list[str] = field(default_factory=list)
+    """Attachments of types we cannot open (PDF, archives, office documents, ...)."""
+
+    ambiguous_original: bool = False
+    """Both an attached and an inline original were found and they disagree."""
+
+    secondary_text: str = ""
+    """Other candidate text (inline text next to an attached original, or a long note above a marker)."""
+
+    outer_message_id: str | None = None
+    """Message-ID of the forward itself, used to thread the reply."""
 
     def to_prompt(self) -> str:
         """Deterministic plain-text rendering of the evidence for the model."""
@@ -120,38 +182,119 @@ class ParsedEmail:
         lines.append("")
         lines.append("## Body" + (" (truncated)" if self.truncated else ""))
         lines.append(self.body)
+        if self.secondary_text:
+            lines.append("")
+            lines.append("## Other text in the forward (secondary evidence)")
+            lines.append(self.secondary_text)
+        if self.hidden_text:
+            lines.append("")
+            lines.append("## Hidden text (present in the email but not visible to the reader)")
+            lines.append(self.hidden_text)
+        if self.uninspectable:
+            lines.append("")
+            lines.append("## Attachments that could not be inspected")
+            lines.extend(f"- {name}" for name in self.uninspectable)
+        for item in self.evidence_dropped:
+            lines.append(f"\nParser note: evidence omitted: {item}")
         for note in self.notes:
             lines.append(f"\nParser note: {note}")
         return "\n".join(lines)
 
 
 class _HTMLText(HTMLParser):
-    """Visible text plus (href, anchor text) pairs; ignores script/style."""
+    """Visible text, hidden text and (href, anchor text) pairs.
+
+    Only script/style/template suppress text. ``<head>``/``<title>`` are not counted: ``</head>``
+    is optional in HTML, and counting it once blanked every following character. Text inside
+    elements hidden by inline style or the ``hidden`` attribute is collected separately, so the
+    model can see it as a finding instead of it being silently dropped. Hiding is tracked with a
+    stack of open elements (with HTML's implicit closes), so an unclosed hidden element can't
+    swallow the visible text that follows it.
+    """
 
     _BLOCK: ClassVar[frozenset[str]] = frozenset(
         {"p", "div", "br", "tr", "li", "h1", "h2", "h3", "h4", "h5", "h6", "table", "blockquote"}
+    )
+    _VOID: ClassVar[frozenset[str]] = frozenset(
+        {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"}
+    )
+    _SKIP: ClassVar[frozenset[str]] = frozenset({"script", "style", "template"})
+    # Elements whose start implicitly closes an open sibling of the same kind.
+    _SELF_CLOSING_SIBLINGS: ClassVar[frozenset[str]] = frozenset({"p", "li", "td", "th", "tr", "option", "dt", "dd"})
+    # Elements whose start implicitly closes an open <p>.
+    _CLOSES_P: ClassVar[frozenset[str]] = frozenset(
+        {
+            "div",
+            "p",
+            "table",
+            "ul",
+            "ol",
+            "dl",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "h6",
+            "blockquote",
+            "section",
+            "article",
+            "header",
+            "footer",
+            "form",
+            "hr",
+            "pre",
+            "nav",
+            "aside",
+        }
     )
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.text: list[str] = []
+        self.hidden: list[str] = []
         self.links: list[Link] = []
         self._skip = 0
+        self._in_title = False
+        self._stack: list[str] = []
+        self._hidden_at: int | None = None  # stack depth of the element that started hiding
         self._href: str | None = None
         self._anchor: list[str] = []
 
+    def _pop_to(self, tag: str) -> None:
+        if tag in self._stack:
+            while self._stack and self._stack.pop() != tag:
+                pass
+        self._check_unhide()
+
+    def _check_unhide(self) -> None:
+        if self._hidden_at is not None and len(self._stack) < self._hidden_at:
+            self._hidden_at = None
+
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag in {"script", "style", "head", "title"}:
+        a = dict(attrs)
+        if tag == "body":
+            self._skip, self._in_title = 0, False
+        elif tag in self._SKIP:
             self._skip += 1
-        elif tag == "a":
-            self._href = (dict(attrs).get("href") or "").strip() or None
+        elif tag == "title":
+            self._in_title = True
+        if tag in self._SELF_CLOSING_SIBLINGS and self._stack and self._stack[-1] == tag:
+            self._pop_to(tag)
+        if tag in self._CLOSES_P and self._stack and self._stack[-1] == "p":
+            self._pop_to("p")
+        if tag not in self._VOID:
+            self._stack.append(tag)
+            if self._hidden_at is None and ("hidden" in a or _HIDDEN_STYLE.search(a.get("style") or "")):
+                self._hidden_at = len(self._stack)
+        if tag == "a":
+            href = (a.get("href") or "").strip()
+            self._href = href or None
             self._anchor = []
         elif tag == "img":
-            alt = dict(attrs).get("alt")
-            if alt:
-                self.handle_data(f"[image: {alt}]")
+            if a.get("alt"):
+                self.handle_data(f"[image: {a['alt']}]")
         else:
-            a = dict(attrs)
             target = {"form": a.get("action"), "area": a.get("href"), "base": a.get("href")}.get(tag)
             if tag == "meta" and (a.get("http-equiv") or "").lower() == "refresh":
                 m = _REFRESH_URL.search(a.get("content") or "")
@@ -159,23 +302,34 @@ class _HTMLText(HTMLParser):
             if target and target.strip():
                 self.links.append(Link(target.strip(), f"[{tag} {'action' if tag == 'form' else 'target'}]"))
         if tag in self._BLOCK:
-            self.text.append("\n")
+            self._out().append("\n")
 
     def handle_endtag(self, tag: str) -> None:
-        if tag in {"script", "style", "head", "title"}:
+        if tag in self._SKIP:
             self._skip = max(0, self._skip - 1)
+        elif tag == "title":
+            self._in_title = False
         elif tag == "a" and self._href is not None:
             self.links.append(Link(self._href, _squash(" ".join(self._anchor))))
             self._href = None
         if tag in self._BLOCK:
-            self.text.append("\n")
+            self._out().append("\n")
+        self._pop_to(tag)
+
+    def _out(self) -> list[str]:
+        return self.hidden if self._hidden_at is not None else self.text
 
     def handle_data(self, data: str) -> None:
-        if self._skip:
+        if self._skip or self._in_title:
             return
-        self.text.append(data)
+        self._out().append(data)
         if self._href is not None:
             self._anchor.append(data)
+
+
+def normalize_for_matching(text: str) -> str:
+    """NFKC, invisible characters removed, whitespace collapsed: defeats trivial regex evasion."""
+    return re.sub(r"\s+", " ", INVISIBLE_CHARS.sub("", unicodedata.normalize("NFKC", text)))
 
 
 def _squash(text: str) -> str:
@@ -234,9 +388,15 @@ def parse_sender_auth(msg: EmailMessage) -> SenderAuth:
         if clauses[0].strip().lower() == "amazonses.com":
             for clause in clauses[1:]:
                 m = _RESINFO.match(clause)
-                if not m or m.group(1).lower() in results:
+                if not m:
                     continue
                 method, verdict, props = m.group(1).lower(), m.group(2).lower(), m.group(3)
+                if method in results:
+                    # SES never repeats a method; a repeat means attacker text became a clause.
+                    return SenderAuth(
+                        spam=(_header(msg, "X-SES-Spam-Verdict") or "").upper() or None,
+                        virus=(_header(msg, "X-SES-Virus-Verdict") or "").upper() or None,
+                    )
                 results[method] = verdict
                 if method == "dmarc" and (hf := _HEADER_FROM.search(props)):
                     dmarc_domain = hf.group(1).strip().lower()
@@ -300,13 +460,15 @@ def _adds_content(plain: str, html_text: str) -> bool:
     return len(missing) >= 3 and len(missing) > len(plain_words) // 5
 
 
-def _inline_parts(msg: EmailMessage):
+def _inline_parts(msg: EmailMessage, depth: int = 0):
     """Non-attachment leaf parts in order, without descending into attached messages."""
+    if depth > MAX_DEPTH:
+        raise ValueError(f"MIME nesting deeper than {MAX_DEPTH}")
     if msg.is_multipart():
         for part in msg.iter_parts():
             if part.get_content_maintype() == "message":
                 continue
-            yield from _inline_parts(part)
+            yield from _inline_parts(part, depth + 1)
     elif not msg.is_attachment():
         yield msg
 
@@ -314,31 +476,49 @@ def _inline_parts(msg: EmailMessage):
 _HTML_ATTACHMENT = re.compile(r"\.(?:s?html?|svg|xhtml)$", re.IGNORECASE)
 
 
-def _html_text(content: str) -> tuple[str, list[Link]]:
+@dataclass
+class _Body:
+    text: str = ""
+    hidden: str = ""
+    links: list[Link] = field(default_factory=list)
+    dropped: list[str] = field(default_factory=list)
+    """Material omissions (body or attachment content): forbid a "safe" verdict."""
+    notes: list[str] = field(default_factory=list)
+    """Minor omissions (link list, URL length): shown to the model only."""
+
+
+def _html_text(content: str) -> tuple[str, str, list[Link]]:
     parser = _HTMLText()
     try:
         parser.feed(content)
         parser.close()
     except Exception:  # noqa: S110 - keep whatever text was parsed before the error
         pass
-    return _clean_text("".join(parser.text)), parser.links
+    visible, hidden = _clean_text("".join(parser.text)), _clean_text("".join(parser.hidden))
+    if not visible and hidden:
+        # Everything "hidden" means our heuristic misread the markup; never lose the content.
+        return f"[note: all text in this part was styled hidden]\n{hidden}", "", parser.links
+    return visible, hidden, parser.links
 
 
-def extract_body(msg: EmailMessage) -> tuple[str, list[Link]]:
-    """Visible text and links from every inline part, plus HTML attachments (a common credential
-    phishing payload). Reads both HTML and plain parts: a phisher can ship a harmless text/plain
-    alternative next to a malicious HTML part."""
+def extract_body(msg: EmailMessage) -> _Body:
+    """Visible text, hidden text and links from every inline part, plus HTML attachments (a common
+    credential phishing payload). Reads both HTML and plain parts: a phisher can ship a harmless
+    text/plain alternative next to a malicious HTML part. Every cap that drops evidence is recorded."""
+    out = _Body()
     html_texts: list[str] = []
+    hidden_texts: list[str] = []
     plain_texts: list[str] = []
-    links: list[Link] = []
     for i, part in enumerate(_inline_parts(msg)):
         if i >= MAX_PARTS:
+            out.dropped.append(f"more than {MAX_PARTS} MIME parts; the rest were not read")
             break
         ctype = part.get_content_type()
         if ctype == "text/html":
-            text, found = _html_text(_decode(part))
+            text, hidden, found = _html_text(_decode(part))
             html_texts.append(text)
-            links.extend(found)
+            hidden_texts.append(hidden)
+            out.links.extend(found)
         elif ctype == "text/plain":
             plain_texts.append(_clean_text(_decode(part)))
 
@@ -348,40 +528,94 @@ def extract_body(msg: EmailMessage) -> tuple[str, list[Link]]:
         text = plain
     elif plain and _adds_content(plain, text):
         text = f"{text}\n\n[text/plain alternative differs from the HTML part]\n{plain}"
+    # URLs in the plain part count even when its words match the HTML part.
+    for url in _URL.findall(plain):
+        out.links.append(Link(url, url))
 
-    for part in list(msg.iter_attachments())[:MAX_ATTACHMENTS]:
+    attachments = [p for p in _attachment_parts(msg) if p.get_content_maintype() != "message"]
+    for part in attachments[:MAX_ATTACHMENTS]:
         name = part.get_filename() or ""
         if part.get_content_type() in {"text/html", "image/svg+xml"} or _HTML_ATTACHMENT.search(name):
-            att_text, found = _html_text(_decode(part))
-            text += f"\n\n[HTML attachment: {_squash(name)[:200] or '(unnamed)'}]\n{att_text[:10_000]}"
-            links.extend(found)
+            att_text, att_hidden, found = _html_text(_decode(part))
+            label = _squash(name)[:200] or "(unnamed)"
+            if len(att_text) > MAX_HTML_ATTACHMENT_CHARS:
+                message = f"HTML attachment {label} cut to {MAX_HTML_ATTACHMENT_CHARS} characters"
+                # Mail clients attach their own rendering of a forward as an unnamed ("noname") HTML
+                # part; cutting that is not losing evidence. A named HTML file is a real payload.
+                unnamed = label.lower() in {"(unnamed)", "noname", "noname.html", "noname.htm"}
+                (out.notes if unnamed else out.dropped).append(message)
+            text += f"\n\n[HTML attachment: {label}]\n{att_text[:MAX_HTML_ATTACHMENT_CHARS]}"
+            hidden_texts.append(att_hidden)
+            out.links.extend(found)
 
-    seen = {link.href for link in links}
+    out.text = text
+    out.hidden = "\n".join(h for h in hidden_texts if h)
     for url in _URL.findall(text):
-        if url not in seen:
-            links.append(Link(url, url))
-            seen.add(url)
-    return text, links[:MAX_LINKS]
+        out.links.append(Link(url, url))
+    out.links = _dedupe_links(out.links, out.notes)
+    return out
 
 
-def extract_attachments(msg: EmailMessage) -> list[Attachment]:
+def _dedupe_links(links: list[Link], notes: list[str]) -> list[Link]:
+    """Dedupe by href (keeping the most informative anchor text), cap URL length, then cap count."""
+    by_href: dict[str, Link] = {}
+    long_urls = 0
+    for link in links:
+        href = link.href
+        if len(href) > MAX_HREF_CHARS:
+            href, long_urls = href[:MAX_HREF_CHARS] + "...", long_urls + 1
+        text = link.text[:300]
+        kept = by_href.get(href)
+        if kept is None or (kept.text in ("", href) and text not in ("", href)):
+            by_href[href] = Link(href, text)
+    if long_urls:
+        notes.append(f"{long_urls} URL(s) longer than {MAX_HREF_CHARS} characters were cut")
+    unique = list(by_href.values())
+    if len(unique) > MAX_LINKS:
+        notes.append(f"{len(unique) - MAX_LINKS} of {len(unique)} distinct links not shown")
+    return unique[:MAX_LINKS]
+
+
+def _attachment_parts(msg: EmailMessage, depth: int = 0):
+    """Every attachment leaf at any depth, without looking inside attached emails. (iter_attachments
+    only sees one level, so a file nested inside an inner multipart/mixed was invisible.)"""
+    if depth > MAX_DEPTH:
+        raise ValueError(f"MIME nesting deeper than {MAX_DEPTH}")
+    for part in msg.iter_parts() if msg.is_multipart() else []:
+        if part.get_content_maintype() == "message":
+            yield part
+        elif part.is_multipart():
+            yield from _attachment_parts(part, depth + 1)
+        elif part.is_attachment() or (part.get_filename() and part.get_content_maintype() != "text"):
+            yield part
+
+
+_SAFE_OPAQUE_EXT = re.compile(r"\.(?:png|jpe?g|gif|bmp|webp|heic|tiff?|txt|csv|vcf|ics|json|xml|log)$", re.IGNORECASE)
+
+
+def extract_attachments(msg: EmailMessage, dropped: list[str]) -> tuple[list[Attachment], list[str]]:
     found: list[Attachment] = []
-    for part in msg.iter_attachments():
-        if len(found) >= MAX_ATTACHMENTS:
-            break
+    uninspectable: list[str] = []
+    attachments = list(_attachment_parts(msg))
+    if len(attachments) > MAX_ATTACHMENTS:
+        dropped.append(f"{len(attachments) - MAX_ATTACHMENTS} of {len(attachments)} attachments not listed")
+    for part in attachments[:MAX_ATTACHMENTS]:
+        if part.get_content_maintype() == "message":
+            continue  # attached emails are analyzed (or listed as secondary), not opened as files
         try:
             data = part.get_payload(decode=True) or b""
         except Exception:
             data = b""
+        name = _squash(part.get_filename() or "(unnamed)")[:200]
+        ctype = part.get_content_type()
         found.append(
-            Attachment(
-                filename=_squash(part.get_filename() or "(unnamed)")[:200],
-                content_type=part.get_content_type(),
-                size=len(data),
-                sha256=hashlib.sha256(data).hexdigest(),
-            )
+            Attachment(filename=name, content_type=ctype, size=len(data), sha256=hashlib.sha256(data).hexdigest())
         )
-    return found
+        opaque = ctype == "application/octet-stream" and not _SAFE_OPAQUE_EXT.search(name)
+        unreadable = _UNINSPECTABLE_EXT.search(name) or ctype.startswith(_UNINSPECTABLE_TYPES) or opaque
+        if unreadable and not _HTML_ATTACHMENT.search(name):  # HTML/SVG attachments are read as text
+            uninspectable.append(f"{name} ({ctype})")
+    return found, uninspectable
 
 
 _ORIGINAL_HEADERS = (
@@ -401,35 +635,86 @@ _ORIGINAL_HEADERS = (
 )
 
 
+def _forward_split(body: str) -> tuple[str, str] | None:
+    """(text above, original below) for an inline forward found in *visible* text, else None."""
+    if marker := _FORWARD_MARKER.search(body):
+        return body[: marker.start()].strip(), body[marker.end() :].strip()
+    if block := _HEADER_BLOCK.search(body):
+        return body[: block.start()].strip(), body[block.start() :].strip()
+    return None
+
+
+def _inline_identity(text: str) -> tuple[str | None, str | None]:
+    head = text[:2_000]
+    frm = re.search(r"^\s*From:\s*(.+)$", head, re.IGNORECASE | re.MULTILINE)
+    addr = _single_address(frm.group(1)) if frm else None
+    return addr, _inline_subject(head)
+
+
 def parse_email(raw: bytes, *, max_body_chars: int = 60_000) -> ParsedEmail:
     outer: EmailMessage = message_from_bytes(raw, policy=policy.default)  # type: ignore[assignment]
-    # Exactly one From header with exactly one address; SES's DMARC header.from must match it.
-    forwarder = _single_address(_header(outer, "From")) if len(outer.get_all("From", [])) == 1 else None
+    # Exactly one From header holding exactly one address, validated at full length (not truncated).
+    from_headers = outer.get_all("From", [])
+    raw_from = str(from_headers[0]) if len(from_headers) == 1 else ""
+    forwarder = _single_address(raw_from) if 0 < len(raw_from) <= MAX_FROM_CHARS else None
     sender_auth = parse_sender_auth(outer)
     notes: list[str] = []
 
-    outer_body, outer_links = extract_body(outer)
-    marker = _FORWARD_MARKER.search(outer_body)
-    block = None if marker else _HEADER_BLOCK.search(outer_body)
-    # An inline forward wins over attachments: the phish's own attachments (possibly a decoy .eml)
-    # are re-attached by the mail client.
-    original = None if (marker or block) else find_forwarded_original(outer)
-    if marker or block:
-        kind = "inline"
-        body = outer_body[marker.end() :].strip() if marker else outer_body[block.start() :].strip()
-        # Links above the marker belong to the forwarder's own note, not the original.
-        links = [link for link in outer_links if link.href in body or (link.text and link.text in body)] or outer_links
-        attachments = extract_attachments(outer)
-        source = outer
-    elif original is not None:
+    outer_extract = extract_body(outer)
+    dropped = list(outer_extract.dropped)
+    notes.extend(outer_extract.notes)
+    split = _forward_split(outer_extract.text)  # visible text only: hidden markers can't steer this
+    original = find_forwarded_original(outer)
+    secondary = ""
+    ambiguous = False
+
+    if original is not None:
+        # An attached original carries real headers, so it is the primary evidence. Inline text in
+        # the forward (if any) is kept as secondary evidence rather than thrown away.
         kind = "attachment"
-        body, links = extract_body(original)
-        attachments = extract_attachments(original)
+        extracted = extract_body(original)
+        dropped += extracted.dropped
+        notes.extend(extracted.notes)
+        body, links, hidden = extracted.text, extracted.links, extracted.hidden
+        attachments, uninspectable = extract_attachments(original, dropped)
         source = original
+        if split:
+            # Both an inline forward and an attached email. Mail clients re-attach a phish's own
+            # attachments, so the attached email may be a decoy carried by the real lure. Keep
+            # both, include the inline links and the forward's other attachments, and never allow
+            # a "safe" verdict.
+            inline = split[1]
+            secondary = f"[inline text in the forward]\n{inline}"
+            ambiguous = True
+            notes.append("The forward contains both inline forwarded text and an attached email; both are shown.")
+            links = _dedupe_links(links + outer_extract.links, notes)
+            outer_files, outer_unins = extract_attachments(outer, dropped)
+            attachments += [a for a in outer_files if a not in attachments]
+            uninspectable += [u for u in outer_unins if u not in uninspectable]
+    elif split:
+        kind = "inline"
+        above, body = split
+        # Links above the marker belong to the forwarder's own note, not the original. Links with no
+        # visible text (image buttons) can't be matched to text, so keep them unless they point to
+        # the forwarder's own domain.
+        own = (forwarder or "@").rpartition("@")[2]
+
+        def _belongs(link: Link) -> bool:
+            if link.href in body or (link.text and link.text in body):
+                return True
+            host = (urlsplit(link.href).hostname or "") if link.href.startswith(("http:", "https:")) else ""
+            return not link.text and bool(host) and not (own and host.endswith(own))
+
+        links = [link for link in outer_extract.links if _belongs(link)] or outer_extract.links
+        hidden = outer_extract.hidden
+        attachments, uninspectable = extract_attachments(outer, dropped)
+        source = outer
+        if len(above) > 300:
+            secondary = f"[text above the forward marker, usually the forwarder's own note]\n{above}"
     else:
         kind = "none"
-        body, links = outer_body, outer_links
-        attachments = extract_attachments(outer)
+        body, links, hidden = outer_extract.text, outer_extract.links, outer_extract.hidden
+        attachments, uninspectable = extract_attachments(outer, dropped)
         source = outer
         notes.append("No forwarded message found; analyzing the email exactly as received.")
 
@@ -443,6 +728,10 @@ def parse_email(raw: bytes, *, max_body_chars: int = 60_000) -> ParsedEmail:
                 continue
             if value := _header(source, name):
                 headers[name] = value
+        if "Authentication-Results" in headers and kind == "attachment":
+            headers["Authentication-Results"] = (
+                "(as written in the forwarded email, unverified) " + headers["Authentication-Results"]
+            )
     received = [] if kind == "inline" else [_squash(str(v))[:300] for v in source.get_all("Received", [])[:6]]
 
     subject = (
@@ -456,6 +745,24 @@ def parse_email(raw: bytes, *, max_body_chars: int = 60_000) -> ParsedEmail:
     truncated = len(body) > max_body_chars
     if truncated:
         body = body[:max_body_chars]
+        dropped.append(f"body cut to {max_body_chars} characters")
+    if len(secondary) > MAX_SECONDARY_CHARS:
+        secondary = secondary[:MAX_SECONDARY_CHARS]
+        dropped.append(f"secondary text cut to {MAX_SECONDARY_CHARS} characters")
+    if len(hidden) > MAX_HIDDEN_CHARS:
+        hidden = hidden[:MAX_HIDDEN_CHARS]
+        notes.append(f"hidden text cut to {MAX_HIDDEN_CHARS} characters")
+
+    # Only the original's own text: the forwarder's note ("should I mark this as safe?") is not evidence.
+    markers = [f"hidden: {m.group(0)}" for m in INJECTION_PHRASES.finditer(normalize_for_matching(hidden))]
+    if kind != "none":
+        markers += [f"visible: {m.group(0)}" for m in INJECTION_PHRASES.finditer(normalize_for_matching(body))]
+    mismatches = link_text_mismatches(links)
+    if mismatches:
+        notes.append("Links whose visible text names a different domain than they go to: " + "; ".join(mismatches))
+    invisible = len(INVISIBLE_CHARS.findall(body))
+    if invisible:
+        notes.append(f"{invisible} invisible formatting characters (zero-width or direction marks) in the body.")
 
     return ParsedEmail(
         forwarder=forwarder,
@@ -470,6 +777,66 @@ def parse_email(raw: bytes, *, max_body_chars: int = 60_000) -> ParsedEmail:
         truncated=truncated,
         auto_submitted=_is_automated(outer),
         notes=notes,
+        hidden_text=hidden,
+        injection_markers=markers[:10],
+        evidence_dropped=dropped,
+        uninspectable=uninspectable,
+        ambiguous_original=ambiguous,
+        secondary_text=secondary,
+        outer_message_id=_header(outer, "Message-ID"),
+    )
+
+
+_HOSTLIKE = re.compile(r"^(?:https?://)?(?:www\.)?([a-z0-9-]+(?:\.[a-z0-9-]+)+)(?:[/:?#]\S*)?$", re.IGNORECASE)
+
+
+def _base_domain(host: str) -> str:
+    """Rough registrable domain: last two labels, or three for two-letter country second levels."""
+    labels = host.lower().strip(".").split(".")
+    if len(labels) >= 3 and len(labels[-1]) == 2 and labels[-2] in {"co", "com", "ac", "gov", "org", "net", "edu"}:
+        return ".".join(labels[-3:])
+    return ".".join(labels[-2:])
+
+
+def link_text_mismatches(links: list[Link], limit: int = 5) -> list[str]:
+    """Anchor text that is itself a hostname/URL whose domain differs from the real destination."""
+    found = []
+    for link in links:
+        m = _HOSTLIKE.match(link.text.strip())
+        if not m:
+            continue
+        try:
+            dest = urlsplit(link.href).hostname or ""
+        except ValueError:
+            continue
+        if dest and _base_domain(m.group(1)) != _base_domain(dest):
+            found.append(f"text {m.group(1)} -> goes to {dest}")
+        if len(found) >= limit:
+            break
+    return found
+
+
+def parse_headers(raw: bytes) -> ParsedEmail:
+    """Headers only, never the body: used to answer emails whose body could not be parsed."""
+    from email.parser import BytesHeaderParser
+
+    outer = BytesHeaderParser(policy=policy.default).parsebytes(raw)
+    from_headers = outer.get_all("From", [])
+    raw_from = str(from_headers[0]) if len(from_headers) == 1 else ""
+    subject = re.sub(r"^\s*((fwd?|fw)\s*:\s*)+", "", _header(outer, "Subject") or "", flags=re.IGNORECASE)
+    return ParsedEmail(
+        forwarder=_single_address(raw_from) if 0 < len(raw_from) <= MAX_FROM_CHARS else None,
+        sender_auth=parse_sender_auth(outer),
+        subject=(subject or DEFAULT_SUBJECT)[:250],
+        forward_kind="none",
+        headers={},
+        received=[],
+        body="",
+        links=[],
+        attachments=[],
+        truncated=False,
+        auto_submitted=_is_automated(outer),
+        outer_message_id=_header(outer, "Message-ID"),
     )
 
 

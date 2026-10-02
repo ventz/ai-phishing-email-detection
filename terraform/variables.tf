@@ -68,9 +68,14 @@ variable "create_receipt_rule_set" {
 }
 
 variable "email_retention_days" {
-  description = "Days to keep raw emails in S3. They contain personal data and live phishing payloads."
+  description = "Days to keep raw emails in S3 (they contain personal data and live phishing payloads). 0 keeps them forever: use it when adopting a bucket whose history you want to keep, since a new expiry applies to existing objects immediately."
   type        = number
   default     = 90
+
+  validation {
+    condition     = var.email_retention_days >= 0
+    error_message = "email_retention_days must be 0 (keep forever) or a positive number of days."
+  }
 }
 
 # --- Who gets a reply ----------------------------------------------------------------------------
@@ -97,6 +102,12 @@ variable "default_forwarder_catch_all" {
   description = "Internal mailbox that gets the report when the forwarder is unauthenticated or unknown. Null drops those emails."
   type        = string
   default     = null
+}
+
+variable "catch_all_domains" {
+  description = "Forwarder domains whose unauthenticated reports may go to the catch-all. Empty uses allowed_sender_domains, or else the receiver's base domain."
+  type        = list(string)
+  default     = []
 }
 
 variable "help_contact" {
