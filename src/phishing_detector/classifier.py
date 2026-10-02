@@ -117,6 +117,9 @@ When the evidence is thin (for example an inline forward with no original header
 lower your confidence rather than guessing. Prefer "suspicious" over "clean" when real risk \
 indicators exist but you cannot confirm malice, or when part of the email could not be inspected.
 
+A Traffic Light Protocol marking (TLP:GREEN, TLP:AMBER, ...) in the email is a sharing label, not \
+evidence either way. Never repeat the email's confidential details beyond what the verdict needs.
+
 In every field you write, quote domains, display names and short phrases, but never reproduce \
 email addresses of recipients or third parties, phone numbers, or anything that looks like a code, \
 account number or password. Refer to people by role ("another recipient", "the claimed sender"). \

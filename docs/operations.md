@@ -26,6 +26,9 @@ The function writes JSON logs to `/aws/lambda/<project_name>`. Useful messages:
 | `no reply sent` | `reason` says why (DMARC failure, domain not allowed, auto-submitted, ...) |
 | `classified` | Model, stop reason, token usage, and cache reads and writes |
 | `classification failed` | The user got the NOT ANALYZED reply |
+| `TLP-restricted email tagged for expiry` | A TLP:AMBER/RED report was detected; its raw email is removed by lifecycle within ~1-2 days |
+| `guardrails raised verdict` | A deterministic rule raised the model's verdict; `reasons` lists which |
+| `email could not be parsed` / `email too large to analyze` | The reporter got a NOT ANALYZED reply |
 | `duplicate event skipped` | The email was already handled (retry or redelivery) |
 | `InFlight` error | Another attempt holds a fresh claim; Lambda retries later |
 
@@ -45,3 +48,13 @@ event: fix the cause, then `replay` the key.
 Per email at the default Opus 5.5 at `low` effort: about 1.5K cached prompt tokens, 1–4K fresh
 input tokens, and 0.5–1K output tokens. Lambda time is 10–20 seconds at 512 MB. Reserved
 concurrency (5 by default) is the ceiling on spend during a flood.
+
+## Testing attachments end to end
+
+Mail clients often drop attachments when forwarding inline (Superhuman does), so a forward is a
+poor test of PDF or QR handling. Instead, build a test `.eml` that forwards a sample *as an
+attachment*, from your own address, and put it straight into the bucket under a `synthetic-test-`
+key. The S3 notification triggers the function exactly as for real mail, and the reply comes to
+you. Afterwards delete the object and its `bucket/key` item in the idempotency table.
+
+Never replay other people's stored reports to test: the reply goes to the original reporter.

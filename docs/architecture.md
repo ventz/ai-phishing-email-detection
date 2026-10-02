@@ -1,5 +1,89 @@
 # Architecture
 
+- [Components](#components)
+- [Processing pipeline](#processing-pipeline)
+- [Who gets a reply](#who-gets-a-reply)
+- [Request flow](#request-flow)
+- [Security model](#security-model)
+- [Design decisions](#design-decisions)
+
+## Components
+
+```mermaid
+flowchart LR
+    accTitle: AWS components
+    accDescr: Amazon SES receives mail for the phishing address through a receipt rule and writes it to an encrypted S3 bucket. The bucket notifies the Lambda function, which uses a DynamoDB table for idempotency, calls Claude through the Amazon Bedrock Messages API, and sends replies with SES. Invocations that fail after retries go to an SQS failure queue watched by a CloudWatch alarm. Logs go to CloudWatch Logs.
+    subgraph Email
+        SES[SES receipt rule<br/>TLS required, spam + virus scan]
+        SESOUT[SES v2 send]
+    end
+    subgraph Storage
+        S3[(S3 bucket<br/>encrypted, TLS-only)]
+        DDB[(DynamoDB<br/>idempotency, TTL)]
+    end
+    subgraph Compute
+        L[Lambda<br/>python3.13 arm64, 1024 MB]
+    end
+    subgraph Model
+        BR[Bedrock Messages API<br/>Claude Opus 5.5]
+    end
+    subgraph Operations
+        DLQ[(SQS failure queue)]
+        AL[CloudWatch alarm]
+        CW[CloudWatch Logs, JSON]
+    end
+    SES --> S3 --> L
+    L --> DDB
+    L --> BR
+    L --> SESOUT
+    L -.-> DLQ --> AL
+    L --> CW
+```
+
+## Processing pipeline
+
+```mermaid
+flowchart TD
+    accTitle: How one reported email is processed
+    accDescr: For each S3 event the function claims the email in DynamoDB, fetches it, and routes it using the headers alone. Unroutable mail is dropped before any attachment is opened. Otherwise it parses the body and attachments within a budget, unwraps links, checks lookalike domains and the Microsoft 365 flag, asks Claude for a verdict, raises the verdict with deterministic guardrails if needed, renders an escaped and defanged reply, records that a send is starting, and sends it. A model failure produces a NOT ANALYZED reply instead of a verdict.
+    E[S3 event] --> C{Claim in DynamoDB}
+    C -->|already handled| X1([skip])
+    C -->|claimed| F[Fetch email<br/>10 MB cap]
+    F -->|too large:<br/>route on headers| NA[NOT ANALYZED reply]
+    F --> H[Route on headers only]
+    H -->|no reply due| X2([drop, log reason])
+    H -->|reply to reporter<br/>or catch-all| P[Parse body + attachments<br/>budget: 5 PDFs, 40 pages,<br/>25 images, 30 s]
+    P -->|unparseable:<br/>route on headers| NA
+    P --> EV[Evidence: headers, links unwrapped,<br/>PDF text, QR codes, hidden text,<br/>lookalikes, Microsoft 365 flag]
+    EV --> M[Claude on Bedrock<br/>record_verdict tool]
+    M -->|failure or refusal| NA
+    M --> G[Guardrails<br/>raise only, never lower]
+    G --> R[Render reply<br/>fixed subject, escaped, defanged]
+    NA --> S
+    R --> S[Mark sending, then SES send]
+    S --> D([Mark done])
+```
+
+## Who gets a reply
+
+```mermaid
+flowchart TD
+    accTitle: Reply routing
+    accDescr: Automated mail and messages from service addresses are dropped. A forwarder outside the allowed domains is dropped. A forwarder whose domain passed DMARC, according to the first Authentication-Results header written by SES, gets the reply. Otherwise spam is dropped, and a failed forwarder from the organization's own domains goes to the catch-all mailbox if one is configured.
+    A{Auto-submitted, bounce,<br/>or list mail?} -->|yes| D1([drop])
+    A -->|no| B{From a service or<br/>no-reply address?}
+    B -->|yes| D1
+    B -->|no| C{Domain allowed?}
+    C -->|no| D1
+    C -->|yes| E{DMARC pass for the<br/>From domain, per SES?}
+    E -->|yes| R([reply to the reporter])
+    E -->|no| F{SES spam verdict FAIL?}
+    F -->|yes| D1
+    F -->|no| G{Catch-all set and domain<br/>in catch_all_domains?}
+    G -->|yes| CA([report to the catch-all])
+    G -->|no| D1
+```
+
 ## Request flow
 
 1. **SES receives** mail for the phishing address. The receipt rule requires TLS, runs spam and
@@ -80,6 +164,7 @@
 | Reply used as a lure or tripping content filters | Fixed subject `Phishing report result: <VERDICT> (ref …)`, never the phish's subject; the body states who reported it and when; "safe" summaries are templated; phone numbers removed and third-party addresses masked |
 | Failures reported as "clean" | Any classification failure sends **NOT ANALYZED — treat as suspicious** |
 | Model output injects links or HTML into the reply | Everything is HTML-escaped. URLs and domains, including internationalized (IDN) domains, are defanged, and bidirectional and zero-width characters are stripped |
+| Restricted (TLP:AMBER / RED) reports outlive their audience | Still analyzed and answered. The raw email is tagged before any reply is sent, and a lifecycle rule removes tagged objects within one to two days, so cleanup survives crashes and failed sends; the function role cannot delete from the bucket. The catch-all gets only a content-free notice. Hidden text is ignored when reading the label, so a phish can't use one to hide. TLP:GREEN and CLEAR are handled normally. Bedrock invocation logging is off; the bucket has no versioning, replication or backup copies |
 | Catch-all GitHub issues leak personal data | Issues carry metadata only: verdict, reason, S3 key, sender and link domains, attachment hashes |
 | Long-lived credentials | No static keys: the Lambda role, or an optional assumed role. The GitHub token lives in Secrets Manager and never enters Terraform state |
 | Stored emails contain personal data and live payloads | Bucket is private, owner-enforced, SSE, and TLS-only; the SES write is scoped by `SourceArn`; lifecycle expiry. Logs record keys and verdicts, never content |

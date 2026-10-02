@@ -42,17 +42,35 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "emails" {
 }
 
 resource "aws_s3_bucket_lifecycle_configuration" "emails" {
-  count  = var.email_retention_days > 0 ? 1 : 0
   bucket = aws_s3_bucket.emails.id
+
+  # TLP:AMBER/RED reports: analyzed and answered, then removed (the function tags them).
   rule {
-    id     = "expire-emails"
+    id     = "expire-tlp-restricted"
     status = "Enabled"
-    filter {}
-    expiration {
-      days = var.email_retention_days
+    filter {
+      tag {
+        key   = "tlp"
+        value = "restricted"
+      }
     }
-    abort_incomplete_multipart_upload {
-      days_after_initiation = 1
+    expiration {
+      days = 1
+    }
+  }
+
+  dynamic "rule" {
+    for_each = var.email_retention_days > 0 ? [1] : []
+    content {
+      id     = "expire-emails"
+      status = "Enabled"
+      filter {}
+      expiration {
+        days = var.email_retention_days
+      }
+      abort_incomplete_multipart_upload {
+        days_after_initiation = 1
+      }
     }
   }
 }
@@ -178,6 +196,12 @@ data "aws_iam_policy_document" "lambda" {
   statement {
     sid       = "ReadEmails"
     actions   = ["s3:GetObject"]
+    resources = ["${aws_s3_bucket.emails.arn}/*"]
+  }
+
+  statement {
+    sid       = "TagRestrictedEmails" # TLP:AMBER/RED: tagged, then expired by the lifecycle rule
+    actions   = ["s3:PutObjectTagging"]
     resources = ["${aws_s3_bucket.emails.arn}/*"]
   }
 

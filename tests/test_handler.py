@@ -233,3 +233,121 @@ def test_unroutable_sender_is_dropped_before_attachments_are_opened(monkeypatch,
     monkeypatch.setattr(handler, "parse_email", must_not_parse)
     assert "dropped" in handler.lambda_handler(event(), None)["body"]
     assert fakes == []
+
+
+def _tlp_email(label: str, auth=True) -> bytes:
+    from email.message import EmailMessage
+    from email.policy import SMTP
+
+    from conftest import SES_AUTH
+
+    original = EmailMessage()
+    original["From"] = "advisories@isac.example"
+    original["Subject"] = "Advisory"
+    original.set_content(f"TLP:{label}\nIndicators for a campaign. Do not share.")
+    outer = EmailMessage()
+    if auth:
+        outer["Authentication-Results"] = SES_AUTH
+    outer["From"] = "alice@example.org"
+    outer.set_content("fyi")
+    outer.add_attachment(original)
+    return outer.as_bytes(policy=SMTP)
+
+
+@pytest.mark.parametrize(
+    ("label", "deleted"), [("AMBER", True), ("RED", True), ("AMBER+STRICT", True), ("GREEN", False), ("CLEAR", False)]
+)
+def test_tlp_restricted_reports_are_analyzed_then_deleted(monkeypatch, cfg, fakes, label, deleted):
+    removed = []
+    monkeypatch.setattr(handler, "_settings", cfg)
+    monkeypatch.setattr(services, "fetch_email", lambda b, k, m: _tlp_email(label))
+    monkeypatch.setattr(services, "mark_restricted", lambda b, k, t: removed.append(k))
+    monkeypatch.setattr(
+        handler,
+        "classify",
+        lambda e, c, **kw: Verdict(
+            verdict=Label.CLEAN, confidence=Confidence.LOW, summary="ok", indicators=["ok"], tips=[]
+        ),
+    )
+    assert '"outcome": "clean"' in handler.lambda_handler(event(), None)["body"]
+    assert len(fakes) == 1  # always analyzed and answered
+    assert removed == (["abc123"] if deleted else [])
+
+
+def test_tlp_restricted_report_never_goes_to_catch_all(monkeypatch, cfg, fakes):
+    removed = []
+    monkeypatch.setattr(
+        handler, "_settings", replace(cfg, catch_all="soc@example.org", catch_all_domains=frozenset({"example.org"}))
+    )
+    monkeypatch.setattr(services, "fetch_email", lambda b, k, m: _tlp_email("RED", auth=False))
+    monkeypatch.setattr(services, "mark_restricted", lambda b, k, t: removed.append(k))
+    monkeypatch.setattr(
+        handler,
+        "classify",
+        lambda e, c, **kw: Verdict(
+            verdict=Label.PHISHING, confidence=Confidence.HIGH, summary="secret summary", indicators=["secret"], tips=[]
+        ),
+    )
+    handler.lambda_handler(event(), None)
+    [(reply, kw)] = fakes
+    assert kw["to"] == "soc@example.org" and removed == ["abc123"]
+    assert "TLP:RED" in reply.text and "PHISHING" in reply.text
+    assert "secret" not in reply.text and "Advisory" not in reply.text and "Indicators" not in reply.text
+
+
+def test_tlp_restricted_mail_dropped_before_parsing_is_still_deleted(monkeypatch, cfg, fakes):
+    removed = []
+    monkeypatch.setattr(handler, "_settings", cfg)  # no catch-all: unauthenticated mail is dropped early
+    monkeypatch.setattr(services, "fetch_email", lambda b, k, m: _tlp_email("AMBER", auth=False))
+    monkeypatch.setattr(services, "mark_restricted", lambda b, k, t: removed.append(k))
+    assert "dropped" in handler.lambda_handler(event(), None)["body"]
+    assert fakes == [] and removed == ["abc123"]
+
+
+def test_tlp_in_base64_body_is_found_before_parsing(monkeypatch, cfg, fakes):
+    from email.message import EmailMessage
+    from email.policy import SMTP
+
+    removed = []
+    m = EmailMessage()
+    m["From"] = "alice@example.org"
+    m.set_content("Résumé: TLP:AMBER — internal only", cte="base64")
+    monkeypatch.setattr(handler, "_settings", cfg)  # unauthenticated: dropped before full parse
+    monkeypatch.setattr(services, "fetch_email", lambda b, k, mx: m.as_bytes(policy=SMTP))
+    monkeypatch.setattr(services, "mark_restricted", lambda b, k, t: removed.append((k, t)))
+    handler.lambda_handler(event(), None)
+    assert removed == [("abc123", "AMBER")]
+
+
+def test_hidden_tlp_label_is_ignored():
+    from email.message import EmailMessage
+    from email.policy import SMTP
+
+    m = EmailMessage()
+    m["From"] = "alice@example.org"
+    m.set_content("x")
+    m.add_alternative("<p>Click here</p><div style='display:none'>TLP:RED</div>", subtype="html")
+    assert parse_email(m.as_bytes(policy=SMTP)).tlp is None
+
+
+def test_too_large_restricted_email_is_tagged(monkeypatch, cfg, fakes):
+    removed = []
+    monkeypatch.setattr(handler, "_settings", cfg)
+
+    def too_big(b, k, m):
+        raise services.EmailTooLarge("big", _tlp_email("AMBER"))
+
+    monkeypatch.setattr(services, "fetch_email", too_big)
+    monkeypatch.setattr(services, "mark_restricted", lambda b, k, t: removed.append(k))
+    assert "too_large" in handler.lambda_handler(event(), None)["body"]
+    assert removed == ["abc123"] and len(fakes) == 1
+
+
+def test_object_already_gone_is_final(monkeypatch, cfg, fakes):
+    monkeypatch.setattr(handler, "_settings", cfg)
+
+    def gone(b, k, m):
+        raise services.EmailGone(k)
+
+    monkeypatch.setattr(services, "fetch_email", gone)
+    assert "gone" in handler.lambda_handler(event(), None)["body"] and fakes == []

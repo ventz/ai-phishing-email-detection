@@ -396,3 +396,13 @@ def test_header_only_parse_for_unparseable_mail():
     raw = forward_as_attachment(phish())
     email = parse_headers(raw)
     assert email.forwarder == "alice@example.org" and email.sender_auth.dmarc == "pass" and email.body == ""
+
+
+def test_tlp_marking_most_restrictive_wins():
+    from phishing_detector.parsing import tlp_marking
+
+    assert tlp_marking("TLP:GREEN header", "body TLP: AMBER + STRICT") == "AMBER+STRICT"
+    assert tlp_marking("TLP:WHITE") == "CLEAR"
+    assert tlp_marking("no marking here") is None
+    assert tlp_marking("TLP-RED") == "RED" and tlp_marking("TLP：AMBER") == "AMBER"
+    assert tlp_marking("TLP:\u200bRED") == "RED"

@@ -169,6 +169,14 @@ class ParsedEmail:
     risky_links: list[str] = field(default_factory=list)
     """Every link (before the display cap) to a raw IP or internationalized host."""
 
+    tlp: str | None = None
+    """Most restrictive Traffic Light Protocol marking found (RED, AMBER+STRICT, AMBER, GREEN, CLEAR)."""
+
+    @property
+    def tlp_restricted(self) -> bool:
+        """AMBER or RED: may not be shared beyond its recipients' organization, so we don't keep it."""
+        return self.tlp in {"RED", "AMBER+STRICT", "AMBER"}
+
     outer_message_id: str | None = None
     """Message-ID of the forward itself, used to thread the reply."""
 
@@ -937,6 +945,9 @@ def parse_email(raw: bytes, *, max_body_chars: int = 60_000, attachment_seconds:
         upstream_verdict=upstream,
         lookalikes=lookalikes,
         risky_links=risky_links,
+        # Hidden text is ignored on purpose: a real sender never hides a TLP label, an attacker might
+        # (to get a phish dropped from the catch-all or expired from the evidence bucket).
+        tlp=tlp_marking(subject, _header(outer, "Subject") or "", outer_extract.text, body, secondary, attachment_text),
         outer_message_id=_header(outer, "Message-ID"),
     )
 
@@ -1014,6 +1025,49 @@ def _microsoft_verdict(msg: EmailMessage) -> str | None:
     # "Not flagged" is NOT reported: nearly every reported phish got past the filter, so a clean
     # verdict carries no information and would only bias the model toward "safe".
     return None
+
+
+_TLP = re.compile(r"\bTLP\s*[:：\-_ ]\s*(RED|AMBER\s*\+\s*STRICT|AMBER|GREEN|CLEAR|WHITE)\b", re.IGNORECASE)
+_TLP_RANK = {"RED": 4, "AMBER+STRICT": 3, "AMBER": 2, "GREEN": 1, "CLEAR": 0}
+
+
+def tlp_marking(*texts: str) -> str | None:
+    """Most restrictive TLP label in the texts (TLP 1.0's WHITE is today's CLEAR)."""
+    found = None
+    for text in texts:
+        for m in _TLP.finditer(normalize_for_matching(text or "")):
+            label = re.sub(r"\s+", "", m.group(1).upper()).replace("WHITE", "CLEAR")
+            if found is None or _TLP_RANK[label] > _TLP_RANK[found]:
+                found = label
+    return found
+
+
+RESTRICTED_TLP = frozenset({"RED", "AMBER+STRICT", "AMBER"})
+MAX_TLP_SCAN_BYTES = 1024 * 1024
+
+
+def tlp_from_raw(raw: bytes) -> str | None:
+    """TLP marking without analyzing the email: decoded subjects plus the decoded text of text/*
+    parts (base64 and quoted-printable included), descending into attached emails. Never opens PDFs,
+    images or other attachments, so it is safe to run for senders we won't answer."""
+    try:
+        msg = message_from_bytes(raw, policy=policy.default)
+    except Exception:
+        return tlp_marking(raw[:MAX_TLP_SCAN_BYTES].decode("latin-1"))
+    texts, budget = [], MAX_TLP_SCAN_BYTES
+    for i, part in enumerate(msg.walk()):
+        if i > MAX_PARTS or budget <= 0:
+            break
+        if part.get_content_maintype() == "message":
+            inner = _attached_message(part)
+            if inner is not None:
+                texts.append(_header(inner, "Subject") or "")
+            continue
+        if part.get_content_maintype() == "text" and not part.is_multipart():
+            text = _decode(part)[:budget]
+            budget -= len(text)
+            texts.append(_html_text(text)[0] if part.get_content_subtype() == "html" else text)
+    return tlp_marking(_header(msg, "Subject") or "", *texts)
 
 
 def route_headers(raw: bytes) -> ParsedEmail:
