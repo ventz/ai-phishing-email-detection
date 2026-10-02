@@ -53,11 +53,33 @@ class EmailTooLarge(ValueError):
 
 def fetch_email(bucket: str, key: str, max_bytes: int, head_bytes: int = 256 * 1024) -> bytes:
     s3 = client("s3")
-    size = s3.head_object(Bucket=bucket, Key=key)["ContentLength"]
+    try:
+        size = s3.head_object(Bucket=bucket, Key=key)["ContentLength"]
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") in {"404", "NoSuchKey", "NotFound"}:
+            raise EmailGone(key) from exc
+        raise
     if size > max_bytes:
         head = s3.get_object(Bucket=bucket, Key=key, Range=f"bytes=0-{head_bytes - 1}")["Body"].read()
         raise EmailTooLarge(f"{size} bytes exceeds the {max_bytes}-byte limit", head)
     return s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+
+
+def mark_restricted(bucket: str, key: str, tlp: str) -> None:
+    """Tag a TLP:AMBER/RED email; a bucket lifecycle rule expires tagged objects after one day.
+    Tagging (not deleting) keeps the object readable for a retry and means the function role
+    never needs permission to delete from the evidence bucket."""
+    client("s3").put_object_tagging(
+        Bucket=bucket,
+        Key=key,
+        Tagging={
+            "TagSet": [{"Key": "tlp", "Value": "restricted"}, {"Key": "tlp-label", "Value": tlp.replace("+", "-")}]
+        },
+    )
+
+
+class EmailGone(LookupError):
+    """The object no longer exists (expired or removed): nothing left to do."""
 
 
 def send_reply(

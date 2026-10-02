@@ -85,21 +85,23 @@ See [Operations](docs/operations.md) for replaying emails, the failure queue, an
 ## Architecture
 
 ```mermaid
-graph LR
-    accTitle: Phishing analysis flow
-    accDescr: A user forwards an email to SES. SES stores it in S3, which triggers Lambda. Lambda sends the extracted evidence to Claude on Amazon Bedrock, then emails the verdict back to the user through SES.
-    User -->|forwards email| SES[Amazon SES]
-    SES -->|stores raw email| S3[(S3)]
+flowchart LR
+    accTitle: Phishing report flow
+    accDescr: A user forwards a suspicious email to the phishing address. Amazon SES stores it in S3, which triggers the Lambda function. Lambda checks the forwarder, extracts evidence from the email and its attachments, asks Claude on Amazon Bedrock for a verdict, applies deterministic guardrails, and emails the verdict back through SES. DynamoDB prevents duplicate replies and failed emails go to an SQS queue.
+    User([Reporter]) -->|forwards email| SES[Amazon SES]
+    SES -->|stores raw email| S3[(S3 bucket)]
     S3 -->|object created| Lambda[Lambda]
-    Lambda -->|evidence| Bedrock[Claude on Bedrock]
-    Bedrock -->|verdict| Lambda
+    Lambda <-->|evidence / verdict| Bedrock[Claude on Bedrock]
+    Lambda <-->|claim, once only| DDB[(DynamoDB)]
+    Lambda -.->|after retries| DLQ[(SQS failure queue)]
     Lambda -->|reply| SES
     SES -->|verdict + explanation| User
 ```
 
 A user forwards an email to SES, which stores it in S3 and triggers the Lambda function. The
-function sends the extracted evidence to Claude on Bedrock and replies with the verdict through
-SES. Details are in [Architecture](docs/architecture.md).
+function checks who forwarded it, extracts the evidence (headers, links, PDFs, QR codes), asks
+Claude on Bedrock for a verdict, applies deterministic guardrails, and replies through SES.
+Details are in [Architecture](docs/architecture.md).
 
 ## Documentation
 

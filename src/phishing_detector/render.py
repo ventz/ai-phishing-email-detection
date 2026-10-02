@@ -253,3 +253,25 @@ def render_unavailable(ctx: ReportContext, reason: str | None = None) -> Reply:
         html=_page(_UNAVAILABLE, _UNAVAILABLE.heading, sections, reason, ctx),
         text=_text(_UNAVAILABLE, sections, reason, ctx),
     )
+
+
+def render_restricted_notice(ctx: ReportContext, tlp: str, verdict_tag: str) -> Reply:
+    """Content-free notice for the catch-all: a TLP:AMBER/RED report may not be shared further, so
+    say only that one arrived, who forwarded it, and the outcome."""
+    lines = [
+        f"A report marked TLP:{tlp} was received from {ctx.forwarder or 'an unknown sender'} "
+        f"on {ctx.received_at or 'an unknown date'} (reference {ctx.ref}).",
+        "The forwarder's address could not be authenticated, so no reply was sent to them.",
+        f"Automated result: {verdict_tag}. The content is not included because of its TLP marking; "
+        "the stored copy expires within two days.",
+    ]
+    html_body = "".join(
+        f'<p style="font-family:Arial,Helvetica,sans-serif;font-size:16px;">{html.escape(x)}</p>' for x in lines
+    )
+    page = (
+        f'<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Restricted report</title></head>'
+        f"<body>{html_body}</body></html>"
+    )
+    return Reply(
+        subject=f"Phishing report: TLP-restricted report received (ref {ctx.ref})", html=page, text="\n\n".join(lines)
+    )

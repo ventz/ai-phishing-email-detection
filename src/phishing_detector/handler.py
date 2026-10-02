@@ -15,8 +15,8 @@ from typing import Any
 from . import guardrails, services
 from .classifier import ClassificationError, Verdict, classify
 from .config import Settings
-from .parsing import ParsedEmail, parse_email, parse_headers
-from .render import Reply, ReportContext, defang, render_unavailable, render_verdict
+from .parsing import RESTRICTED_TLP, ParsedEmail, parse_email, parse_headers, tlp_from_raw
+from .render import Reply, ReportContext, defang, render_restricted_notice, render_unavailable, render_verdict
 
 logger = logging.getLogger("phishing_detector")
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
@@ -144,6 +144,9 @@ def process(bucket: str, key: str, cfg: Settings, deadline: float | None = None)
 
     try:
         raw = services.fetch_email(bucket, key, cfg.max_email_bytes)
+    except services.EmailGone:
+        idem.complete(idem_key, token, "gone")
+        return "gone"
     except services.EmailTooLarge as exc:
         return _not_analyzed(
             exc.head, key, cfg, idem, idem_key, token, "too_large", "The email was too large to analyze automatically."
@@ -160,12 +163,13 @@ def process(bucket: str, key: str, cfg: Settings, deadline: float | None = None)
     if early is not None and early.to is None:
         logger.warning("no reply sent", extra={"key": key, "reason": early.reason})
         idem.complete(idem_key, token, "dropped")
+        _mark_if_restricted(bucket, key, tlp_from_raw(raw))
         return "dropped"
 
     try:
         email = parse_email(raw, max_body_chars=cfg.max_body_chars)
     except Exception as exc:  # malformed or hostile MIME: retrying won't help
-        logger.warning("email could not be parsed", extra={"key": key, "error": repr(exc)[:300]})
+        logger.warning("email could not be parsed", extra={"key": key, "error": type(exc).__name__})
         return _not_analyzed(
             raw[: 256 * 1024],
             key,
@@ -179,6 +183,7 @@ def process(bucket: str, key: str, cfg: Settings, deadline: float | None = None)
 
     try:
         route = route_reply(email, cfg)
+        _mark_if_restricted(bucket, key, email.tlp)  # before any send: cleanup can't depend on finishing
         if route.to is None:
             logger.warning("no reply sent", extra={"key": key, "reason": route.reason})
             idem.complete(idem_key, token, "dropped")
@@ -194,10 +199,15 @@ def process(bucket: str, key: str, cfg: Settings, deadline: float | None = None)
                     "guardrails raised verdict", extra={"key": key, "verdict": verdict.verdict.value, "reasons": raised}
                 )
             reply: Reply = render_verdict(verdict, ctx)
+            if route.catch_all and email.tlp_restricted:
+                # TLP:AMBER/RED may not be shared further: the catch-all learns only that it arrived.
+                reply = render_restricted_notice(ctx, email.tlp, reply.subject.split(": ", 1)[1].split(" (")[0])
         except ClassificationError as exc:
             logger.error("classification failed", extra={"key": key, "error": str(exc)})
             verdict = None
             reply = render_unavailable(ctx)
+            if route.catch_all and email.tlp_restricted:
+                reply = render_restricted_notice(ctx, email.tlp, "NOT ANALYZED")
 
         message_id = _send(idem, idem_key, token, reply, route.to, cfg, email.outer_message_id)
     except services.SendUnknown:
@@ -207,12 +217,12 @@ def process(bucket: str, key: str, cfg: Settings, deadline: float | None = None)
         raise
 
     outcome = verdict.verdict.value if verdict else "unavailable"
-    idem.complete(idem_key, token, outcome)
+    idem.complete(idem_key, token, f"{outcome};tlp={email.tlp}" if email.tlp_restricted else outcome)
     logger.info(
         "reply sent", extra={"key": key, "verdict": outcome, "catch_all": route.catch_all, "ses_message_id": message_id}
     )
 
-    if route.catch_all and cfg.github_repo and cfg.github_token_secret_arn:
+    if route.catch_all and cfg.github_repo and cfg.github_token_secret_arn and not email.tlp_restricted:
         services.open_github_issue(
             repo=cfg.github_repo,
             token_secret_arn=cfg.github_token_secret_arn,
@@ -220,6 +230,18 @@ def process(bucket: str, key: str, cfg: Settings, deadline: float | None = None)
             body=_issue_body(key, email, verdict, route),
         )
     return outcome
+
+
+def _mark_if_restricted(bucket: str, key: str, tlp: str | None) -> None:
+    """TLP:AMBER/RED: tag for expiry (the lifecycle rule removes it within ~1-2 days). The bucket
+    otherwise keeps emails forever and is readable more widely than the original recipients."""
+    if tlp not in RESTRICTED_TLP:
+        return
+    try:
+        services.mark_restricted(bucket, key, tlp)
+        logger.info("TLP-restricted email tagged for expiry", extra={"key": key, "tlp": tlp})
+    except Exception:
+        logger.error("could not tag TLP-restricted email", extra={"key": key, "tlp": tlp}, exc_info=True)
 
 
 def _not_analyzed(
@@ -233,8 +255,13 @@ def _not_analyzed(
         except Exception:
             email = None
         route = route_reply(email, cfg) if email else Route(None, "unparseable headers")
+        tlp = tlp_from_raw(head)
+        _mark_if_restricted(idem_key.split("/", 1)[0], key, tlp)
         if route.to:
-            reply = render_unavailable(_context(key, email, cfg), reason=reason)
+            ctx = _context(key, email, cfg)
+            reply = render_unavailable(ctx, reason=reason)
+            if route.catch_all and tlp in RESTRICTED_TLP:
+                reply = render_restricted_notice(ctx, tlp, "NOT ANALYZED")
             _send(idem, idem_key, token, reply, route.to, cfg, email.outer_message_id if email else None)
         else:
             logger.warning("no reply sent", extra={"key": key, "reason": route.reason})
