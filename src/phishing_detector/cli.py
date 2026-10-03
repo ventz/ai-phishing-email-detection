@@ -63,7 +63,10 @@ def _settings(args: argparse.Namespace) -> Settings:
 def cmd_analyze(args: argparse.Namespace) -> None:
     email = parse_email(_raw(args.bucket, args.key))
     try:
-        verdict = classify(email, _settings(args))
+        settings = _settings(args)
+        if email.tlp_restricted and not settings.analyze_tlp_restricted:
+            raise ClassificationError(f"{email.tlp} report not sent to the model (ANALYZE_TLP_RESTRICTED is off)")
+        verdict = classify(email, settings)
         verdict, _ = guardrails.apply(email, verdict)
         reply = render_verdict(verdict, ReportContext(email.subject, email.forwarder, ref="local"))
     except ClassificationError as exc:

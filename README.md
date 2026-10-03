@@ -6,7 +6,8 @@
 
 Forward a suspicious email to one address and get a reply within a minute: a verdict (phishing,
 suspicious, or likely safe) plus the specific red flags that led to it, so people learn to spot the
-next one. It runs serverless on AWS with Claude on Amazon Bedrock.
+next one. It runs serverless on AWS with Claude on Amazon Bedrock by default, or with the Claude API, OpenAI,
+or any compatible endpoint.
 
 ## Table of Contents
 
@@ -63,6 +64,8 @@ access, and adopting an existing deployment.
 - **Hardened AWS setup**: no static keys, and the IAM policy is least-privilege. The S3 bucket is
   encrypted, TLS-only, and expires old emails. Duplicate replies are prevented, failed emails go to
   a queue with an alarm, and concurrency is capped.
+- **Bring your own model**: Bedrock (IAM role, no keys), the Claude API, OpenAI, or any
+  Anthropic- or OpenAI-compatible endpoint, with keys kept in Secrets Manager.
 - **Operator CLI**: list stored emails, see exactly what the model sees, run an analysis locally,
   or replay an email through the deployed function.
 
