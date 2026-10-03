@@ -237,7 +237,8 @@ data "aws_iam_policy_document" "lambda" {
   }
 
   dynamic "statement" {
-    for_each = var.bedrock_role_arn == null ? [1] : []
+    # Bedrock through the function's own role: only when that is how the model is reached.
+    for_each = var.llm_provider == "bedrock" && var.bedrock_role_arn == null && var.llm_api_key_secret_arn == null ? [1] : []
     content {
       # Claude Messages API on Bedrock. bedrock-mantle has no per-model resource type yet.
       sid       = "BedrockMessages"
@@ -252,11 +253,20 @@ data "aws_iam_policy_document" "lambda" {
   }
 
   dynamic "statement" {
-    for_each = var.bedrock_role_arn == null ? [] : [1]
+    for_each = var.llm_provider == "bedrock" && var.bedrock_role_arn != null ? [1] : []
     content {
       sid       = "AssumeBedrockRole"
       actions   = ["sts:AssumeRole"]
       resources = [var.bedrock_role_arn]
+    }
+  }
+
+  dynamic "statement" {
+    for_each = var.llm_api_key_secret_arn == null ? [] : [1]
+    content {
+      sid       = "LlmApiKey"
+      actions   = ["secretsmanager:GetSecretValue"]
+      resources = [var.llm_api_key_secret_arn]
     }
   }
 
@@ -304,7 +314,14 @@ resource "aws_lambda_function" "this" {
       CATCH_ALL_DOMAINS           = join(",", var.catch_all_domains)
       REQUIRE_SENDER_AUTH         = tostring(var.require_sender_auth)
       HELP_CONTACT                = var.help_contact
+      LLM_PROVIDER                = var.llm_provider
       MODEL_ID                    = var.model_id
+      LLM_API_KEY_SECRET_ARN      = var.llm_api_key_secret_arn
+      LLM_BASE_URL                = var.llm_base_url
+      LLM_API_STYLE               = var.llm_provider == "custom" ? var.llm_api_style : null
+      LLM_AUTH_HEADER             = var.llm_auth_header
+      LLM_AUTH_SCHEME             = var.llm_auth_scheme
+      ANALYZE_TLP_RESTRICTED      = var.analyze_tlp_restricted == null ? null : tostring(var.analyze_tlp_restricted)
       MODEL_EFFORT                = var.model_effort
       FALLBACK_MODEL_ID           = var.fallback_model_id
       BEDROCK_ROLE_ARN            = var.bedrock_role_arn
@@ -316,6 +333,30 @@ resource "aws_lambda_function" "this" {
   }
 
   lifecycle {
+    precondition {
+      condition     = var.llm_provider == "bedrock" || var.llm_api_key_secret_arn != null
+      error_message = "llm_provider = ${var.llm_provider} needs llm_api_key_secret_arn (the key, stored in Secrets Manager)."
+    }
+    precondition {
+      condition     = var.llm_provider != "custom" || try(startswith(var.llm_base_url, "https://"), false)
+      error_message = "llm_provider = custom needs an https:// llm_base_url."
+    }
+    precondition {
+      condition     = var.llm_base_url == null || (var.llm_provider != "bedrock" && try(startswith(var.llm_base_url, "https://"), false))
+      error_message = "llm_base_url must be https:// and does not apply to llm_provider = bedrock."
+    }
+    precondition {
+      condition     = var.llm_provider == "custom" || (var.llm_auth_header == null && var.llm_auth_scheme == null)
+      error_message = "llm_auth_header and llm_auth_scheme only apply to llm_provider = custom."
+    }
+    precondition {
+      condition     = var.llm_auth_scheme == null || var.llm_auth_header != null
+      error_message = "llm_auth_scheme needs llm_auth_header."
+    }
+    precondition {
+      condition     = var.bedrock_role_arn == null || (var.llm_provider == "bedrock" && var.llm_api_key_secret_arn == null)
+      error_message = "bedrock_role_arn only applies to llm_provider = bedrock, and not together with llm_api_key_secret_arn."
+    }
     precondition {
       condition     = length(var.allowed_sender_domains) > 0 || var.allow_any_sender_domain
       error_message = "Set allowed_sender_domains (recommended), or allow_any_sender_domain = true to answer any DMARC-authenticated sender on the internet (every analysis costs a model call)."

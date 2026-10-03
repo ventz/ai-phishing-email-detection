@@ -118,20 +118,90 @@ variable "help_contact" {
 
 # --- Model ---------------------------------------------------------------------------------------
 
+variable "llm_provider" {
+  description = "Model provider: bedrock (IAM role, default), anthropic (Claude API), openai, or custom (any Anthropic- or OpenAI-compatible endpoint)."
+  type        = string
+  default     = "bedrock"
+
+  validation {
+    condition     = contains(["bedrock", "anthropic", "openai", "custom"], var.llm_provider)
+    error_message = "llm_provider must be bedrock, anthropic, openai or custom."
+  }
+}
+
 variable "model_id" {
-  description = "Bedrock model ID for the Messages API (bedrock-mantle)."
+  description = "Model ID for the chosen provider, e.g. anthropic.claude-opus-5-5 (Bedrock), claude-opus-5-5 (Claude API), or an OpenAI model."
   type        = string
   default     = "anthropic.claude-opus-5-5"
 }
 
+variable "llm_api_key_secret_arn" {
+  description = "Secrets Manager secret holding the provider API key (plain string or {\"api_key\": \"...\"}). Required for anthropic, openai and custom; optional for bedrock (a Bedrock API key, instead of the IAM role). Use the full ARN including its 6-character suffix. Created outside Terraform so the key never enters state; a secret encrypted with a customer-managed KMS key also needs kms:Decrypt on the Lambda role."
+  type        = string
+  default     = null
+}
+
+variable "llm_base_url" {
+  description = "custom (required) or anthropic/openai (optional, e.g. a regional endpoint): the base URL, https://host[/path] with no credentials or query."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.llm_base_url == null || can(regex("^https://[^/@?#\\s]+(/[^@?#\\s]*)?$", var.llm_base_url))
+    error_message = "llm_base_url must be https://host[/path], with no credentials, query or fragment."
+  }
+}
+
+variable "llm_api_style" {
+  description = "custom only: anthropic (Messages API) or openai (chat completions)."
+  type        = string
+  default     = "anthropic"
+
+  validation {
+    condition     = contains(["anthropic", "openai"], var.llm_api_style)
+    error_message = "llm_api_style must be anthropic or openai."
+  }
+}
+
+variable "llm_auth_header" {
+  description = "custom only: header that carries the key when the gateway doesn't use the SDK default (e.g. apikey)."
+  type        = string
+  default     = null
+
+  validation {
+    condition = var.llm_auth_header == null || (
+      can(regex("^[A-Za-z0-9!#$%&'*+.^_`|~-]+$", var.llm_auth_header)) &&
+      !contains(["host", "content-length", "content-type", "transfer-encoding", "connection"], lower(coalesce(var.llm_auth_header, "x")))
+    )
+    error_message = "llm_auth_header must be a valid HTTP header name, not Host, Content-Length, Content-Type, Transfer-Encoding or Connection."
+  }
+}
+
+variable "llm_auth_scheme" {
+  description = "custom only: optional prefix for that header, e.g. Bearer. Needs llm_auth_header."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.llm_auth_scheme == null || can(regex("^[A-Za-z0-9._~+/-]+$", var.llm_auth_scheme))
+    error_message = "llm_auth_scheme must be a single token, e.g. Bearer."
+  }
+}
+
+variable "analyze_tlp_restricted" {
+  description = "Send TLP:AMBER/RED reports to the model. Null means true for bedrock (the email stays in your AWS account) and false for third-party providers, where such reports get a NOT ANALYZED reply."
+  type        = bool
+  default     = null
+}
+
 variable "model_effort" {
-  description = "Claude effort level: low | medium | high | xhigh | max. Low is ample for classification."
+  description = "Claude effort level: low | medium | high | xhigh | max, or none to omit it (non-Claude models or endpoints that reject it)."
   type        = string
   default     = "low"
 
   validation {
-    condition     = contains(["low", "medium", "high", "xhigh", "max"], var.model_effort)
-    error_message = "model_effort must be one of low, medium, high, xhigh, max."
+    condition     = contains(["low", "medium", "high", "xhigh", "max", "none"], var.model_effort)
+    error_message = "model_effort must be one of low, medium, high, xhigh, max, none."
   }
 }
 

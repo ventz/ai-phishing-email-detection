@@ -1,4 +1,4 @@
-"""Ask Claude on Amazon Bedrock for a structured phishing verdict."""
+"""Ask the configured model (Claude on Amazon Bedrock by default) for a structured phishing verdict."""
 
 from __future__ import annotations
 
@@ -7,13 +7,15 @@ import re
 import time
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Annotated
+from typing import Annotated, Any
 
 import anthropic
-from anthropic import AnthropicBedrockMantle, BetaFallbackState, BetaRefusalFallbackMiddleware
+import openai
+from anthropic import BetaFallbackState
 from botocore.exceptions import BotoCoreError, ClientError
 from pydantic import BaseModel, Field, StringConstraints, ValidationError
 
+from . import providers
 from .config import Settings
 from .parsing import ParsedEmail
 
@@ -125,50 +127,13 @@ email addresses of recipients or third parties, phone numbers, or anything that 
 account number or password. Refer to people by role ("another recipient", "the claimed sender"). \
 Keep every point concrete and specific to this email; do not pad with generic advice.
 
-Always finish by calling the record_verdict tool exactly once. Do not answer in prose.
 """
-
-
-_ASSUMED_ROLE_SECONDS = 3600
-_cached: tuple[Settings, float, AnthropicBedrockMantle] | None = None
-
-
-def _credentials(settings: Settings) -> dict[str, str]:
-    if not settings.bedrock_role_arn:
-        return {}  # Lambda execution role via the default AWS credential chain
-    import boto3
-
-    creds = boto3.client("sts").assume_role(
-        RoleArn=settings.bedrock_role_arn,
-        RoleSessionName="phishing-detector",
-        DurationSeconds=_ASSUMED_ROLE_SECONDS,
-    )["Credentials"]
-    return {
-        "aws_access_key": creds["AccessKeyId"],
-        "aws_secret_key": creds["SecretAccessKey"],
-        "aws_session_token": creds["SessionToken"],
-    }
-
-
-def _client(settings: Settings) -> AnthropicBedrockMantle:
-    """One client per warm container; rebuilt before assumed-role credentials expire."""
-    global _cached
-    now = time.monotonic()
-    if _cached and _cached[0] == settings and now < _cached[1]:
-        return _cached[2]
-    middleware = []
-    if settings.fallback_model_id:
-        middleware.append(BetaRefusalFallbackMiddleware([{"model": settings.fallback_model_id}]))
-    client = AnthropicBedrockMantle(
-        aws_region=settings.bedrock_region,
-        timeout=anthropic.Timeout(60.0, connect=5.0),  # per call, narrowed to the Lambda deadline in _call
-        max_retries=2,
-        middleware=middleware,
-        **_credentials(settings),
-    )
-    ttl = _ASSUMED_ROLE_SECONDS - 600 if settings.bedrock_role_arn else float("inf")
-    _cached = (settings, now + ttl, client)
-    return client
+_FINISH = {
+    "anthropic": "Always finish by calling the record_verdict tool exactly once. Do not answer in prose.\n",
+    "openai": "Answer only with the verdict object in the required JSON format.\n",
+}
+SYSTEM_PROMPT = SYSTEM_PROMPT + _FINISH["anthropic"]
+_OPENAI_SYSTEM_PROMPT = SYSTEM_PROMPT.removesuffix(_FINISH["anthropic"]) + _FINISH["openai"]
 
 
 VERDICT_TOOL = {
@@ -179,18 +144,43 @@ VERDICT_TOOL = {
 # Bedrock's Messages endpoint rejects `strict` tools and `output_config.format`, and Opus/Sonnet 5.5
 # reject forced tool_choice, so: tool_choice=auto + instruction, Pydantic validation, one re-prompt.
 _INSTRUCTION = "Classify the forwarded email by calling record_verdict."
+_OPENAI_INSTRUCTION = "Classify the forwarded email."
 
 
-def build_user_turn(email: ParsedEmail, today: datetime | None = None) -> str:
+def build_user_turn(email: ParsedEmail, today: datetime | None = None, *, instruction: str = _INSTRUCTION) -> str:
     today = today or datetime.now(UTC)
     evidence = _EVIDENCE_TAG.sub("[email_evidence tag removed]", email.to_prompt())
-    return f"Today's date: {today:%B %-d, %Y}\n\n<email_evidence>\n{evidence}\n</email_evidence>\n\n{_INSTRUCTION}"
+    return f"Today's date: {today:%B %-d, %Y}\n\n<email_evidence>\n{evidence}\n</email_evidence>\n\n{instruction}"
+
+
+# The OpenAI path asks for Verdict without length limits, which strict structured outputs and many
+# compatible servers reject; points are trimmed, then validated as a Verdict. (No docstring: it
+# would become the schema's description, i.e. part of the prompt.)
+class _LooseVerdict(BaseModel):
+    verdict: Label = Verdict.model_fields["verdict"]
+    confidence: Confidence
+    summary: str = Field(description=Verdict.model_fields["summary"].description)
+    indicators: list[str] = Field(description=Verdict.model_fields["indicators"].description)
+    tips: list[str] = Field(description=Verdict.model_fields["tips"].description)
+
+    def to_verdict(self) -> Verdict:
+        def trim(text: str) -> str:
+            text = text.strip()
+            return text if len(text) <= 400 else text[:399].rstrip() + "\u2026"
+
+        return Verdict(
+            verdict=self.verdict,
+            confidence=self.confidence,
+            summary=trim(self.summary),
+            indicators=[trim(p) for p in self.indicators if p.strip()],
+            tips=[trim(p) for p in self.tips if p.strip()],
+        )
 
 
 _RETRYABLE = {408, 409, 429, 500, 502, 503, 504, 529}
 
 
-def _call(client: AnthropicBedrockMantle, settings: Settings, messages: list[dict], deadline: float) -> object:
+def _call(client: Any, settings: Settings, messages: list[dict], deadline: float) -> object:
     """One model request with our own retries, so nothing (SDK backoff, Retry-After, the refusal
     fallback) can run past the Lambda deadline: a slow model ends in a NOT ANALYZED reply, never in
     a killed invocation."""
@@ -206,22 +196,25 @@ def _call(client: AnthropicBedrockMantle, settings: Settings, messages: list[dic
                     max_tokens=16_000,
                     # Cache only the static prefix (tools + system); every email is unique.
                     system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
-                    output_config={"effort": settings.effort},
+                    **({"output_config": {"effort": settings.effort}} if settings.effort != "none" else {}),
                     tools=[VERDICT_TOOL],
                     tool_choice={"type": "auto"},
                     messages=messages,
+                    extra_headers=providers.request_headers(settings) or None,
                 )
         except anthropic.APIStatusError as exc:
             request_id = exc.request_id or (exc.body.get("request_id") if isinstance(exc.body, dict) else None)
-            last = ClassificationError(f"Bedrock returned HTTP {exc.status_code} (request {request_id})")
+            last = ClassificationError(f"Model API returned HTTP {exc.status_code} (request {request_id})")
             last.__cause__ = exc
+            if exc.status_code in {401, 403}:
+                providers.forget_credentials()
             if exc.status_code not in _RETRYABLE:
                 raise last from exc
         except (anthropic.APIConnectionError, anthropic.APITimeoutError) as exc:
-            last = ClassificationError(f"Could not reach Bedrock: {type(exc).__name__}")
+            last = ClassificationError(f"Could not reach the model API: {type(exc).__name__}")
             last.__cause__ = exc
-        except anthropic.APIError as exc:  # response validation, middleware and other SDK failures
-            raise ClassificationError(f"Bedrock call failed: {type(exc).__name__}") from exc
+        except (anthropic.AnthropicError, TypeError, BotoCoreError, RuntimeError) as exc:  # SDK, signing, auth
+            raise ClassificationError(f"Model call failed: {type(exc).__name__}") from exc
         # Short backoff, never longer than the time we'd still have for another real attempt.
         time.sleep(max(0.0, min(2.0**attempt, deadline - time.monotonic() - 25)))
     raise last or ClassificationError("Not enough time left to call the model")
@@ -231,16 +224,27 @@ def classify(
     email: ParsedEmail,
     settings: Settings,
     *,
-    client: AnthropicBedrockMantle | None = None,
+    client: Any | None = None,
     deadline: float | None = None,
 ) -> Verdict:
     """``deadline`` is a ``time.monotonic()`` value; None means no limit (local use)."""
     deadline = time.monotonic() + 3600 if deadline is None else deadline
     if client is None:
         try:
-            client = _client(settings)
-        except (ClientError, BotoCoreError) as exc:  # e.g. AssumeRole denied
-            raise ClassificationError(f"Could not get Bedrock credentials: {type(exc).__name__}") from exc
+            client = providers.client(settings)
+        except (  # AssumeRole denied; missing, empty or malformed secret; SDK setup errors
+            ClientError,
+            BotoCoreError,
+            ValueError,
+            KeyError,
+            TypeError,
+            RuntimeError,
+            anthropic.AnthropicError,
+            openai.OpenAIError,
+        ) as exc:
+            raise ClassificationError(f"Could not set up the model client: {type(exc).__name__}") from exc
+    if providers.api_style(settings) == "openai":
+        return _classify_openai(client, settings, email, deadline)
     messages: list[dict] = [{"role": "user", "content": build_user_turn(email)}]
     for attempt in (1, 2):
         response = _call(client, settings, messages, deadline)
@@ -287,3 +291,63 @@ def classify(
         else:
             messages.append({"role": "user", "content": f"{problem} {_INSTRUCTION}"})
     raise ClassificationError("No valid verdict after a re-prompt")
+
+
+def _classify_openai(client: Any, settings: Settings, email: ParsedEmail, deadline: float) -> Verdict:
+    """OpenAI or an OpenAI-compatible endpoint: structured output against the Verdict schema."""
+    messages = [
+        {"role": "system", "content": _OPENAI_SYSTEM_PROMPT},
+        {"role": "user", "content": build_user_turn(email, instruction=_OPENAI_INSTRUCTION)},
+    ]
+    last: Exception | None = None
+    for attempt in range(3):
+        remaining = deadline - time.monotonic()
+        if remaining < 20:
+            break
+        try:
+            response = client.with_options(timeout=min(90.0, remaining - 5), max_retries=0).chat.completions.parse(
+                model=settings.model_id,
+                messages=messages,
+                response_format=_LooseVerdict,
+                max_completion_tokens=16_000,
+                extra_headers=providers.request_headers(settings) or None,
+            )
+        except openai.APIStatusError as exc:
+            last = ClassificationError(f"Model API returned HTTP {exc.status_code} (request {exc.request_id})")
+            last.__cause__ = exc
+            if exc.status_code in {401, 403}:
+                providers.forget_credentials()
+            if exc.status_code not in _RETRYABLE:
+                raise last from exc
+        except (openai.APIConnectionError, openai.APITimeoutError) as exc:
+            last = ClassificationError(f"Could not reach the model API: {type(exc).__name__}")
+            last.__cause__ = exc
+        except openai.LengthFinishReasonError as exc:
+            raise ClassificationError("Model hit the output limit before returning a verdict") from exc
+        except openai.ContentFilterFinishReasonError as exc:
+            raise ClassificationError("Model declined to analyze this email (content filter)") from exc
+        except (openai.OpenAIError, ValidationError, TypeError, RuntimeError) as exc:  # incl. schema-invalid output
+            raise ClassificationError(f"Model call failed: {type(exc).__name__}") from exc
+        else:
+            choice = response.choices[0]
+            usage = getattr(response, "usage", None)
+            logger.info(
+                "classified",
+                extra={
+                    "attempt": attempt + 1,
+                    "model": getattr(response, "model", settings.model_id),
+                    "stop_reason": choice.finish_reason,
+                    "input_tokens": getattr(usage, "prompt_tokens", None),
+                    "output_tokens": getattr(usage, "completion_tokens", None),
+                },
+            )
+            if getattr(choice.message, "refusal", None):
+                raise ClassificationError("Model declined to analyze this email")
+            if choice.finish_reason == "length" or choice.message.parsed is None:
+                raise ClassificationError(f"No verdict returned (finish_reason: {choice.finish_reason})")
+            try:
+                return choice.message.parsed.to_verdict()
+            except ValidationError as exc:
+                raise ClassificationError(f"Model returned an unusable verdict: {exc.error_count()} errors") from exc
+        time.sleep(max(0.0, min(2.0**attempt, deadline - time.monotonic() - 25)))
+    raise last or ClassificationError("Not enough time left to call the model")

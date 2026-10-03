@@ -27,6 +27,10 @@ _NO_REPLY_LOCALPARTS = {"mailer-daemon", "postmaster", "noreply", "no-reply", "d
 _settings: Settings | None = None
 
 
+class _NotSent(ClassificationError):
+    """A deliberate skip (policy), not a failure: same NOT ANALYZED reply, logged at INFO."""
+
+
 def settings() -> Settings:
     global _settings
     if _settings is None:
@@ -192,6 +196,9 @@ def process(bucket: str, key: str, cfg: Settings, deadline: float | None = None)
         ctx = _context(key, email, cfg)
         verdict: Verdict | None
         try:
+            if email.tlp_restricted and not cfg.analyze_tlp_restricted:
+                # A third-party provider would process it outside the operator's AWS account.
+                raise _NotSent(f"{email.tlp} report not sent to the model (ANALYZE_TLP_RESTRICTED is off)")
             verdict = classify(email, cfg, deadline=deadline)
             verdict, raised = guardrails.apply(email, verdict)
             if raised:
@@ -203,7 +210,10 @@ def process(bucket: str, key: str, cfg: Settings, deadline: float | None = None)
                 # TLP:AMBER/RED may not be shared further: the catch-all learns only that it arrived.
                 reply = render_restricted_notice(ctx, email.tlp, reply.subject.split(": ", 1)[1].split(" (")[0])
         except ClassificationError as exc:
-            logger.error("classification failed", extra={"key": key, "error": str(exc)})
+            if isinstance(exc, _NotSent):
+                logger.info("not analyzed by policy", extra={"key": key, "reason": str(exc)})
+            else:
+                logger.error("classification failed", extra={"key": key, "error": str(exc)})
             verdict = None
             reply = render_unavailable(ctx)
             if route.catch_all and email.tlp_restricted:

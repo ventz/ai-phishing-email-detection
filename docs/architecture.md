@@ -137,7 +137,9 @@ flowchart TD
    domains, unauthenticated spam, bounces, auto-replies and mailing-list mail are dropped.
 6. **Classify** (`classifier.py`). This step calls the Bedrock Messages API with a static system
    prompt (cached) and a `record_verdict` tool. The tool's input is validated against a Pydantic
-   schema, and the model gets one re-prompt if it doesn't call the tool.
+   schema, and the model gets one re-prompt if it doesn't call the tool. Other providers
+   (`providers.py`) use the same prompt: the Claude API and Anthropic-style endpoints through the
+   same tool call, OpenAI and OpenAI-style endpoints through structured output.
 7. **Guardrails** (`guardrails.py`). Deterministic rules run after the model and can only raise the
    verdict. A virus verdict, hidden text addressed to AI scanners, or Microsoft 365 "high
    confidence phishing" means phishing. A Microsoft 365 phishing/spoof/spam verdict, a typosquat or
@@ -164,9 +166,10 @@ flowchart TD
 | Reply used as a lure or tripping content filters | Fixed subject `Phishing report result: <VERDICT> (ref …)`, never the phish's subject; the body states who reported it and when; "safe" summaries are templated; phone numbers removed and third-party addresses masked |
 | Failures reported as "clean" | Any classification failure sends **NOT ANALYZED — treat as suspicious** |
 | Model output injects links or HTML into the reply | Everything is HTML-escaped. URLs and domains, including internationalized (IDN) domains, are defanged, and bidirectional and zero-width characters are stripped |
-| Restricted (TLP:AMBER / RED) reports outlive their audience | Still analyzed and answered. The raw email is tagged before any reply is sent, and a lifecycle rule removes tagged objects within one to two days, so cleanup survives crashes and failed sends; the function role cannot delete from the bucket. The catch-all gets only a content-free notice. Hidden text is ignored when reading the label, so a phish can't use one to hide. TLP:GREEN and CLEAR are handled normally. Bedrock invocation logging is off; the bucket has no versioning, replication or backup copies |
+| Restricted (TLP:AMBER / RED) reports outlive their audience | Still analyzed and answered. The raw email is tagged before any reply is sent, and a lifecycle rule removes tagged objects within one to two days, so cleanup survives crashes and failed sends; the function role cannot delete from the bucket. The catch-all gets only a content-free notice. Hidden text is ignored when reading the label, so a phish can't use one to hide. TLP:GREEN and CLEAR are handled normally. With a third-party model provider they are not analyzed unless `analyze_tlp_restricted` is set. Bedrock invocation logging is off; the bucket has no versioning, replication or backup copies |
 | Catch-all GitHub issues leak personal data | Issues carry metadata only: verdict, reason, S3 key, sender and link domains, attachment hashes |
-| Long-lived credentials | No static keys: the Lambda role, or an optional assumed role. The GitHub token lives in Secrets Manager and never enters Terraform state |
+| Long-lived credentials | No static keys by default: the Lambda role, or an optional assumed role. Third-party provider keys and the GitHub token live in Secrets Manager and never enter Terraform state |
+| A provider key sent to the wrong host | Every SDK setting is passed explicitly, so `ANTHROPIC_*`/`OPENAI_*` environment variables (a developer's own key, a base URL, extra headers, debug logging) are never read; the function refuses to start while the non-key ones are set. Base URLs must be `https` (plain `http` only for localhost) with no credentials. With a custom auth header, the SDK's own auth header is not sent |
 | Stored emails contain personal data and live payloads | Bucket is private, owner-enforced, SSE, and TLS-only; the SES write is scoped by `SourceArn`; lifecycle expiry. Logs record keys and verdicts, never content |
 | Floods and cost | A domain allowlist is required by default. Reserved concurrency, a 10 MiB size cap, body truncation, prompt caching, and model timeouts that respect the Lambda deadline |
 | Supply chain | Locked dependencies installed with `--require-hashes`; providers pinned with a lock file |

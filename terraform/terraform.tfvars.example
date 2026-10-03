@@ -15,4 +15,13 @@ allowed_sender_domains = ["example.org"]
 # create_receipt_rule_set     = false       # true only in a fresh account
 # model_id                    = "anthropic.claude-opus-5-5"
 # model_effort                = "low"
+
+# Another model provider (default: Claude on Bedrock via the Lambda role; see docs/configuration.md)
+# llm_provider                = "anthropic"   # anthropic | openai | custom
+# llm_api_key_secret_arn      = "arn:aws:secretsmanager:us-east-1:123456789012:secret:phishing-detector/llm-key-AbCdEf"
+#                                             # and set model_id above, e.g. "claude-opus-5-5"
+# llm_base_url                = "https://llm-gateway.example.org/v1"   # custom (required) or a regional endpoint
+# llm_api_style               = "openai"      # custom only: anthropic | openai
+# llm_auth_header             = "apikey"      # custom only, when the gateway wants its own header
+# analyze_tlp_restricted      = false         # third-party providers default to false
 # email_retention_days        = 90
