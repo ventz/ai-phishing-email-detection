@@ -59,7 +59,7 @@ def test_nested_wrappers_and_non_wrappers():
         ("www.paypal.com", None),
         ("outlook.office.com.mcas.ms", None),
         ("login.microsoftonline.com", None),
-        ("click.mail.example.edu", None),
+        ("click.email.chase.com", None),
         ("officedepot.com", None),
         ("apply-now.com", None),
         ("amazon.com.au", None),
