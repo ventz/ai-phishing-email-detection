@@ -1,5 +1,8 @@
 # AI Phishing Email Detection
 
+<p><strong>⭐ If AI Phishing Email Detection is useful to you, please star it: click the ☆ Star button at the top right of the <a href="https://github.com/ventz/ai-phishing-email-detection">GitHub repo page</a>.</strong></p>
+
+<a href="https://github.com/ventz/ai-phishing-email-detection/stargazers"><img src="https://img.shields.io/github/stars/ventz/ai-phishing-email-detection?style=social" alt="GitHub stars"></a>
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
 <img src="https://img.shields.io/badge/python-3.13-blue.svg" alt="Python 3.13">
 <img src="https://img.shields.io/badge/AWS-Lambda%20%7C%20SES%20%7C%20Bedrock-orange.svg" alt="AWS Lambda, SES and Bedrock">
@@ -8,6 +11,17 @@ Forward a suspicious email to one address and get a reply within a minute: a ver
 suspicious, or likely safe) plus the specific red flags that led to it, so people learn to spot the
 next one. It runs serverless on AWS with Claude on Amazon Bedrock by default, or with the Claude API, OpenAI,
 or any compatible endpoint.
+
+<table>
+<tr>
+<td width="50%" valign="top"><a href="docs/images/reply-phishing.jpg"><img src="docs/images/reply-phishing.jpg" alt="A reply titled 'Verdict: phishing' in a red banner, for a fake Microsoft 365 'mailbox storage is full' alert. It lists six red flags, including a misspelled sender domain, a link to a bare IP address, a QR code to a device-login page and a PDF with an automatic open action, then four tips for spotting similar emails."></a></td>
+<td width="50%" valign="top"><a href="docs/images/reply-safe.jpg"><img src="docs/images/reply-safe.jpg" alt="A reply titled 'Verdict: likely safe' in a green banner, for a certificate vendor's newsletter. It lists why the email looks legitimate and explains that confidence is medium because the email was forwarded inline without its original headers."></a></td>
+</tr>
+<tr>
+<td align="center"><em>A phish: the verdict, the red flags, and how to spot the next one</em></td>
+<td align="center"><em>A real newsletter: even "likely safe" explains itself</em></td>
+</tr>
+</table>
 
 ## Table of Contents
 
@@ -49,7 +63,7 @@ access, and adopting an existing deployment.
 - **Structured verdicts**: phishing / suspicious / likely safe, with a confidence level, concrete
   indicators, and "how to spot it" tips. The output is schema-validated, not parsed from free text.
 - **Evidence the model can use**: parses forwards sent as attachments and inline forwards from
-  Gmail and Outlook. It reads PDF text and links, decodes QR codes in images and PDFs, unwraps
+  Gmail, Outlook and Apple Mail. It reads PDF text and links, decodes QR codes in images and PDFs, unwraps
   Proofpoint/Safe Links/Google redirects to the real destination, flags lookalike domains
   (`paypa1.com`, `chase.com-onlinebanking.com`), and uses the recipient's own Microsoft 365
   filter verdict when present. All offline: no attacker URL is ever fetched.
@@ -84,6 +98,27 @@ uv run phishing-tools analyze --key <key> --html r.html # classify locally; send
 ```
 
 See [Operations](docs/operations.md) for replaying emails, the failure queue, and logs.
+
+### Keeping the model current
+
+The model is a setting, not code: `model_id` in `terraform/terraform.tfvars` (default
+`anthropic.claude-opus-5-5`), which Terraform passes to the function as `MODEL_ID`. New models
+ship often, and they can change both verdict quality and the request surface (for example, Opus
+5.5 rejects `temperature` and forced `tool_choice`), so treat an upgrade as a tested change, not a
+string swap:
+
+1. **Check what changed.** Read the provider's migration notes for the new model. Request-shape
+   assumptions are pinned in `tests/test_classifier_config.py`.
+2. **Compare on your own mail.** `analyze` reads the model from the environment and sends nothing,
+   so you can run the same stored emails through both models side by side:
+   ```bash
+   MODEL_ID=anthropic.claude-opus-5-5 uv run phishing-tools analyze --key <key>   # current
+   MODEL_ID=<new model id>             uv run phishing-tools analyze --key <key>   # candidate
+   ```
+   Use a mix of known phishing and known safe emails, and look at the verdicts *and* the
+   explanations.
+3. **Switch.** Set `model_id` in `terraform.tfvars` and `terraform apply`. Optionally keep the old
+   one as `fallback_model_id`. Rolling back is the same one-line change.
 
 ## Architecture
 
