@@ -290,14 +290,18 @@ class _HTMLText(HTMLParser):
         self._skip = 0
         self._in_title = False
         self._stack: list[str] = []
+        self._open: dict[str, int] = {}  # tag -> count on _stack; O(1) membership (quadratic-time DoS otherwise)
         self._hidden_at: int | None = None  # stack depth of the element that started hiding
         self._href: str | None = None
         self._anchor: list[str] = []
 
     def _pop_to(self, tag: str) -> None:
-        if tag in self._stack:
-            while self._stack and self._stack.pop() != tag:
-                pass
+        if self._open.get(tag):
+            while self._stack:
+                popped = self._stack.pop()
+                self._open[popped] -= 1
+                if popped == tag:
+                    break
         self._check_unhide()
 
     def _check_unhide(self) -> None:
@@ -318,6 +322,7 @@ class _HTMLText(HTMLParser):
             self._pop_to("p")
         if tag not in self._VOID:
             self._stack.append(tag)
+            self._open[tag] = self._open.get(tag, 0) + 1
             if self._hidden_at is None and ("hidden" in a or _HIDDEN_STYLE.search(a.get("style") or "")):
                 self._hidden_at = len(self._stack)
         if tag == "a":
@@ -656,7 +661,7 @@ def _image_parts(msg: EmailMessage, depth: int = 0):
 
 
 def extract_attachments(
-    msg: EmailMessage, dropped: list[str], content: _Body | None = None
+    msg: EmailMessage, dropped: list[str], content: _Body | None = None, *, nested_is_uninspectable: bool = False
 ) -> tuple[list[Attachment], list[str]]:
     """List attachments with hashes. When ``content`` is given, also read what we can out of them:
     PDF text, links and embedded images, and QR codes in any image (attached or inline)."""
@@ -667,7 +672,12 @@ def extract_attachments(
         dropped.append(f"{len(attachments) - MAX_ATTACHMENTS} of {len(attachments)} attachments not listed")
     for part in attachments[:MAX_ATTACHMENTS]:
         if part.get_content_maintype() == "message":
-            continue  # attached emails are analyzed (or listed as secondary), not opened as files
+            # In the outer forward this is the reported original itself, analyzed separately. Inside
+            # the original it is an email we never open, so it must not let a verdict come back safe.
+            if nested_is_uninspectable:
+                name = _squash(part.get_filename() or "(attached email)")[:200]
+                uninspectable.append(f"{name} ({part.get_content_type()}; an email inside the reported email)")
+            continue
         try:
             data = part.get_payload(decode=True) or b""
         except Exception:
@@ -705,7 +715,7 @@ def extract_attachments(
     if content is not None:
         for i, part in enumerate(_image_parts(msg)):
             if i >= extractors.MAX_QR_IMAGES:
-                content.notes.append(f"only the first {extractors.MAX_QR_IMAGES} images were checked for QR codes")
+                dropped.append(f"only the first {extractors.MAX_QR_IMAGES} images were checked for QR codes")
                 break
             try:
                 data = part.get_payload(decode=True) or b""
@@ -775,7 +785,7 @@ def parse_email(raw: bytes, *, max_body_chars: int = 60_000, attachment_seconds:
         dropped += extracted.dropped
         notes.extend(extracted.notes)
         body, links, hidden = extracted.text, extracted.links, extracted.hidden
-        attachments, uninspectable = extract_attachments(original, dropped, content)
+        attachments, uninspectable = extract_attachments(original, dropped, content, nested_is_uninspectable=True)
         source = original
         if split:
             # Both an inline forward and an attached email. Mail clients re-attach a phish's own
@@ -895,6 +905,8 @@ def parse_email(raw: bytes, *, max_body_chars: int = 60_000, attachment_seconds:
     )
     subject = re.sub(r"^\s*((fwd?|fw)\s*:\s*)+", "", subject, flags=re.IGNORECASE) or DEFAULT_SUBJECT
 
+    # TLP is read from the untruncated text: a marking past the cut must still gate the provider.
+    full_body, full_secondary = body, secondary
     truncated = len(body) > max_body_chars
     if truncated:
         body = body[:max_body_chars]
@@ -947,7 +959,9 @@ def parse_email(raw: bytes, *, max_body_chars: int = 60_000, attachment_seconds:
         risky_links=risky_links,
         # Hidden text is ignored on purpose: a real sender never hides a TLP label, an attacker might
         # (to get a phish dropped from the catch-all or expired from the evidence bucket).
-        tlp=tlp_marking(subject, _header(outer, "Subject") or "", outer_extract.text, body, secondary, attachment_text),
+        tlp=tlp_marking(
+            subject, _header(outer, "Subject") or "", outer_extract.text, full_body, full_secondary, attachment_text
+        ),
         outer_message_id=_header(outer, "Message-ID"),
     )
 
@@ -1068,11 +1082,6 @@ def tlp_from_raw(raw: bytes) -> str | None:
             budget -= len(text)
             texts.append(_html_text(text)[0] if part.get_content_subtype() == "html" else text)
     return tlp_marking(_header(msg, "Subject") or "", *texts)
-
-
-def route_headers(raw: bytes) -> ParsedEmail:
-    """Headers-only view used to decide routing before any attachment is opened."""
-    return parse_headers(raw)
 
 
 def parse_headers(raw: bytes) -> ParsedEmail:

@@ -11,6 +11,7 @@ permissions:
 jobs:
   python:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -24,11 +25,14 @@ jobs:
 
   terraform:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.5.7 # the oldest supported version; catches newer-only syntax
       - run: terraform -chdir=terraform fmt -check -recursive
       - run: mkdir -p build/lambda && terraform -chdir=terraform init -backend=false -input=false
       - run: terraform -chdir=terraform validate

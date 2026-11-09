@@ -10,21 +10,26 @@ import string
 import unicodedata
 from urllib.parse import parse_qs, unquote, urlsplit
 
-_V3 = re.compile(r"v3/__(?P<url>.+?)__;(?P<enc>.*?)!")
 _V3_TOKEN = re.compile(r"(\*\*.)|(\*)")
 _RUN_LENGTH = {c: i + 2 for i, c in enumerate(string.ascii_uppercase + string.ascii_lowercase + string.digits + "-_")}
 
 
 def _proofpoint_v3(url: str) -> str | None:
-    m = _V3.search(url)
-    if not m:
+    # str.find, not a regex: the old lazy pattern took quadratic time on "__;" repeated without a "!".
+    start = url.find("v3/__")
+    if start < 0:
+        return None
+    start += len("v3/__")
+    end = url.find("__;", start + 1)
+    bang = url.find("!", end + 3) if end >= 0 else -1
+    if bang < 0:
         return None
     try:
-        replacements = base64.urlsafe_b64decode(m.group("enc") + "==").decode("utf-8")
+        replacements = base64.urlsafe_b64decode(url[end + 3 : bang] + "==").decode("utf-8")
     except Exception:
         replacements = ""
     out, pos, used = [], 0, 0
-    text = unquote(m.group("url"))
+    text = unquote(url[start:end])
     for token in _V3_TOKEN.finditer(text):
         out.append(text[pos : token.start()])
         if token.group(1):  # "**X": a run of N replacement characters
@@ -116,6 +121,7 @@ BRANDS = {
     "wellsfargo": {"wellsfargo.com"},
     "chase": {"chase.com"},
     "bankofamerica": {"bankofamerica.com"},
+    # Example organization brand: replace or extend with your own organization's domains.
     "harvard": {"harvard.edu"},
 }
 _CONFUSABLE = str.maketrans({"0": "o", "1": "l", "3": "e", "4": "a", "5": "s", "7": "t", "8": "b", "|": "l", "!": "i"})

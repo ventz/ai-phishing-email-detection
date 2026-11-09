@@ -4,7 +4,7 @@
 uv sync                  # Python 3.13 + dev tools
 uv run pytest            # unit tests (no AWS needed)
 uv run ruff check . && uv run ruff format --check .
-terraform -chdir=terraform fmt -check && terraform -chdir=terraform validate
+terraform -chdir=terraform fmt -check -recursive && terraform -chdir=terraform validate
 ```
 
 - CI (`.github/workflows/ci.yml`) runs the same checks on every push and pull request.

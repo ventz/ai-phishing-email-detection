@@ -133,9 +133,15 @@ def _send(
     except services.SendRejected:
         raise  # SES refused before sending: safe to retry
     except Exception as exc:
-        idem.complete(idem_key, token, "send_unknown")
-        logger.error("reply may or may not have been sent; not retrying", extra={"key": idem_key, "error": repr(exc)})
-        raise services.SendUnknown(str(exc)) from exc
+        # Log the type only: SES error text can include the recipient address.
+        logger.error(
+            "reply may or may not have been sent; not retrying", extra={"key": idem_key, "error": type(exc).__name__}
+        )
+        try:
+            idem.complete(idem_key, token, "send_unknown")
+        except Exception:  # the record stays "sending", which is never resent either
+            logger.error("could not record send_unknown", extra={"key": idem_key}, exc_info=True)
+        raise services.SendUnknown(type(exc).__name__) from exc
 
 
 def process(bucket: str, key: str, cfg: Settings, deadline: float | None = None) -> str:
@@ -152,6 +158,7 @@ def process(bucket: str, key: str, cfg: Settings, deadline: float | None = None)
         idem.complete(idem_key, token, "gone")
         return "gone"
     except services.EmailTooLarge as exc:
+        logger.warning("email too large to analyze", extra={"key": key})
         return _not_analyzed(
             exc.head, key, cfg, idem, idem_key, token, "too_large", "The email was too large to analyze automatically."
         )
@@ -287,7 +294,7 @@ def _not_analyzed(
 def _deadline(context: Any) -> float | None:
     """Monotonic time by which the model call must finish, leaving room to send the reply."""
     remaining_ms = getattr(context, "get_remaining_time_in_millis", None)
-    # Leave 30 s to render and send the reply (SES client: 10 s read timeout, 2 attempts).
+    # Leave 30 s to render and send the reply (SES client: 10 s read timeout, 1 attempt).
     return time.monotonic() + remaining_ms() / 1000 - 30 if remaining_ms else None
 
 

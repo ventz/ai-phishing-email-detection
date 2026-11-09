@@ -29,10 +29,6 @@ OVERRIDE_SUMMARY = (
 )
 
 
-def _host_is_risky(href: str) -> bool:  # kept for callers/tests; logic lives in urls
-    return urls.host_is_risky(href)
-
-
 def floors(email: ParsedEmail) -> list[tuple[Label, str]]:
     """(minimum verdict, reason shown to the user) for every rule that fires."""
     out: list[tuple[Label, str]] = []

@@ -6,7 +6,7 @@
 export AWS_PROFILE=my-profile AWS_REGION=us-east-1
 export PHISHING_BUCKET=example-org-phishing-emails PHISHING_FUNCTION=phishing-email-detection
 
-uv run phishing-tools list [--limit 50] [--prefix p]
+uv run phishing-tools list [--limit N] [--prefix p]
 uv run phishing-tools show    --key <key>              # parsed evidence, exactly as the model sees it
 uv run phishing-tools analyze --key <key> [--html out.html]   # classify locally, send nothing
 uv run phishing-tools replay  --key <key> --yes        # run the deployed function (sends a real reply)
@@ -29,6 +29,8 @@ The function writes JSON logs to `/aws/lambda/<project_name>`. Useful messages:
 | `TLP-restricted email tagged for expiry` | A TLP:AMBER/RED report was detected; its raw email is removed by lifecycle within ~1-2 days |
 | `guardrails raised verdict` | A deterministic rule raised the model's verdict; `reasons` lists which |
 | `email could not be parsed` / `email too large to analyze` | The reporter got a NOT ANALYZED reply |
+| `not analyzed by policy` | A TLP:AMBER/RED report was not sent to a third-party provider (`analyze_tlp_restricted` is off) |
+| `reply may or may not have been sent; not retrying` (ERROR) | SES failed ambiguously mid-send. Check the reporter's inbox before any `replay` |
 | `duplicate event skipped` | The email was already handled (retry or redelivery) |
 | `InFlight` error | Another attempt holds a fresh claim; Lambda retries later |
 
@@ -45,8 +47,9 @@ event: fix the cause, then `replay` the key.
 
 ## Cost
 
-Per email at the default Opus 5.5 at `low` effort: about 1.5K cached prompt tokens, 1–4K fresh
-input tokens, and 0.5–1K output tokens. Lambda time is 10–20 seconds at 512 MB. Reserved
+Per email at the default Opus 5.5 at `low` effort: about 1.5K cached prompt tokens, a median of
+about 700 fresh input tokens (a few thousand for long emails or PDFs), and 0.5–1K output tokens.
+Lambda time is 10–20 seconds at 1024 MB. Reserved
 concurrency (5 by default) is the ceiling on spend during a flood.
 
 ## Testing attachments end to end

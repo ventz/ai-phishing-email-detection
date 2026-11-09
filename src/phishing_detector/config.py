@@ -131,7 +131,7 @@ class Settings:
     """Only reply when SES recorded a DMARC pass for the forwarder (blocks spoofed-From backscatter)."""
 
     catch_all: str | None = None
-    """Internal mailbox that gets the report when the forwarder can't be trusted or determined."""
+    """Internal mailbox that gets the report when the forwarder failed DMARC but is in catch_all_domains."""
 
     catch_all_domains: frozenset[str] = field(default_factory=frozenset)
     """Forwarder domains whose failed reports may go to the catch-all. Defaults to the allowlist,

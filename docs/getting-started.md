@@ -41,7 +41,7 @@ cp terraform/terraform.tfvars.example terraform/terraform.tfvars
 ```
 
 At a minimum, set `s3_bucket_name`, `ses_email_sender`, `ses_phishing_email_receiver`, and
-`allowed_sender_domains`. The plan fails without it unless you set `allow_any_sender_domain`.
+`allowed_sender_domains`. The plan fails without `allowed_sender_domains` unless you set `allow_any_sender_domain = true`.
 Every option is described in [Configuration](configuration.md).
 
 State contains resource IDs and the full configuration. Configure the S3 backend in

@@ -99,7 +99,7 @@ variable "require_sender_auth" {
 }
 
 variable "default_forwarder_catch_all" {
-  description = "Internal mailbox that gets the report when the forwarder is unauthenticated or unknown. Null drops those emails."
+  description = "Internal mailbox that gets the report when the forwarder failed DMARC but is in catch_all_domains. Null drops those emails."
   type        = string
   default     = null
 }
@@ -206,7 +206,7 @@ variable "model_effort" {
 }
 
 variable "fallback_model_id" {
-  description = "Optional Bedrock model ID to retry on when the primary model declines a request."
+  description = "Optional model ID to retry on when the primary model declines a request (bedrock, anthropic, and Anthropic-style custom; not used with OpenAI-style providers)."
   type        = string
   default     = null
 }
@@ -249,8 +249,9 @@ variable "alarm_sns_topic_arn" {
 }
 
 variable "log_retention_days" {
-  type    = number
-  default = 30
+  description = "Days to keep the function's CloudWatch logs."
+  type        = number
+  default     = 30
 }
 
 # --- Optional GitHub issues for catch-all reports ------------------------------------------------

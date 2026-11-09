@@ -89,7 +89,7 @@ aws secretsmanager create-secret --name phishing-detector/llm-key --secret-strin
 |---|---|---|
 | `bedrock` (default) | `model_id = "anthropic.claude-opus-5-5"` | The Lambda's IAM role. Optionally `bedrock_role_arn` for another account, or a Bedrock API key in `llm_api_key_secret_arn` when running outside AWS |
 | `anthropic` | `model_id = "claude-opus-5-5"` | Claude API key |
-| `openai` | `model_id = "<an OpenAI model>"` | OpenAI API key |
+| `openai` | `model_id = "gpt-6.1-sol"` (or another OpenAI model) | OpenAI API key |
 | `custom` | `llm_base_url`, `llm_api_style = "anthropic"` or `"openai"`, `model_id` | API key in the SDK's default header, or in `llm_auth_header` (with optional `llm_auth_scheme`), e.g. an API gateway that expects `apikey: <key>`. The SDK's own auth header is then not sent |
 
 For example, an OpenAI-compatible gateway:
@@ -126,7 +126,7 @@ analyzed by default.
 
 ## Choosing a model
 
-Opus 5.5 at `low` effort is the default. It takes about 10–15 seconds and roughly 2–3K input
-tokens per email, and caches the 1.5K-token static prompt. For higher volume, `anthropic.claude-sonnet-5-5`
-costs half as much. Compare the two on a sample of your own stored emails with
+Opus 5.5 at `low` effort is the default. It takes about 10–20 seconds and a median of about 700
+fresh input tokens per email, and caches the 1.5K-token static prompt. For higher volume,
+`anthropic.claude-sonnet-5-5` costs about half as much per token at Anthropic's list prices. Compare the two on a sample of your own stored emails with
 `phishing-tools analyze` before you switch.

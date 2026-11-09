@@ -12,9 +12,14 @@ dependencies = [
     "openai>=3.23,<4",
     "pillow>=12,<13",
     "pydantic>=2.11,<3",
-    "pypdf>=6.19,<7",
+    "pypdf>=6.21.4,<7",
     "zxing-cpp>=3.1,<4",
 ]
+
+[project.urls]
+Homepage = "https://github.com/ventz/ai-phishing-email-detection"
+Repository = "https://github.com/ventz/ai-phishing-email-detection"
+Issues = "https://github.com/ventz/ai-phishing-email-detection/issues"
 
 [project.scripts]
 phishing-tools = "phishing_detector.cli:main"

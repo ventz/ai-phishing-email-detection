@@ -20,6 +20,7 @@ MAX_PDF_IMAGES = 20
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 MAX_IMAGE_PIXELS = 25_000_000  # ~100 MB decoded RGBA: safe in a 512 MB Lambda
 MAX_QR_IMAGES = 15
+MAX_LINK_CHARS = 2_000  # same as parsing.MAX_HREF_CHARS: bounds the work done per link
 MAX_PDF_LINKS = 200  # all are risk-checked; the display cap ranks PDF links last
 
 try:  # set at import so every decode is bounded, not only those after decode_qr ran once
@@ -125,7 +126,8 @@ def decode_qr(image_bytes: bytes, budget: Budget | None = None) -> list[str]:
                 frame = img.convert("L")
             if max(frame.size) > _MAX_DECODE_SIDE:
                 frame.thumbnail((_MAX_DECODE_SIDE, _MAX_DECODE_SIDE))
-        return [r.text for r in zxingcpp.read_barcodes(frame, formats=zxingcpp.BarcodeFormat.QRCode) if r.text][:10]
+        codes = zxingcpp.read_barcodes(frame, formats=zxingcpp.BarcodeFormat.QRCode)
+        return [r.text[:MAX_LINK_CHARS] for r in codes if r.text][:10]
     except Exception as exc:  # unsupported format, decompression bomb, corrupt data
         logger.info("image not decoded", extra={"error": type(exc).__name__})
         return []
@@ -187,7 +189,7 @@ def _read_pdf(reader, out: PdfEvidence, budget: Budget) -> None:
             if isinstance(uri, bytes):
                 uri = uri.decode("latin-1", errors="replace")
             if isinstance(uri, str) and uri.strip():
-                out.links.append(uri.strip())
+                out.links.append(uri.strip()[:MAX_LINK_CHARS])
         try:
             for image in page.images:
                 if images >= MAX_PDF_IMAGES:

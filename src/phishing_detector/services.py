@@ -13,7 +13,7 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
-from .render import _PHONE, Reply
+from .render import PHONE_RE, Reply
 
 logger = logging.getLogger(__name__)
 
@@ -216,7 +216,7 @@ _PII = [
     (re.compile(r"\b(?:https?://|www\.)\S+", re.IGNORECASE), "[URL]"),
     (re.compile(r"\b(?:\d[ -]?){13,19}\b"), "[CARD]"),
     (re.compile(r"\b\d{3}-\d{2}-\d{4}\b"), "[SSN]"),
-    (_PHONE, "[PHONE]"),
+    (PHONE_RE, "[PHONE]"),
 ]
 
 

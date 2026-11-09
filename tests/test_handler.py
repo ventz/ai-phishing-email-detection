@@ -351,3 +351,26 @@ def test_object_already_gone_is_final(monkeypatch, cfg, fakes):
 
     monkeypatch.setattr(services, "fetch_email", gone)
     assert "gone" in handler.lambda_handler(event(), None)["body"] and fakes == []
+
+
+def test_ambiguous_send_stays_closed_when_recording_it_fails(monkeypatch, cfg):
+    """If writing send_unknown fails too, the claim must not be released (a retry would resend)."""
+    released = []
+    monkeypatch.setattr(handler, "_settings", cfg)
+    monkeypatch.setattr(services, "fetch_email", lambda b, k, m: forward_inline())
+    monkeypatch.setattr(
+        handler,
+        "classify",
+        lambda e, c, **kw: Verdict(
+            verdict=Label.CLEAN, confidence=Confidence.LOW, summary="ok", indicators=["ok"], tips=[]
+        ),
+    )
+    monkeypatch.setattr(services, "send_reply", lambda *a, **k: (_ for _ in ()).throw(TimeoutError("read timeout")))
+    monkeypatch.setattr(services.Idempotency, "release", lambda self, key, token: released.append(key))
+    monkeypatch.setattr(
+        services.Idempotency,
+        "complete",
+        lambda self, key, token, outcome: (_ for _ in ()).throw(ConnectionError("dynamodb down")),
+    )
+    assert "send_unknown" in handler.lambda_handler(event(), None)["body"]
+    assert released == []

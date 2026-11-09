@@ -94,11 +94,13 @@ flowchart TD
 3. **Idempotency.** The function claims `bucket/key` in DynamoDB, with a per-attempt token,
    before any side effect. S3 redeliveries and Lambda retries therefore never send a second reply.
    A retry that finds a *fresh* claim raises an error, so it backs off and eventually reaches the
-   failure queue instead of being dropped silently. A claim older than the Lambda timeout is
-   taken over.
-4. **Parse** (`parsing.py`, pure). This step finds the forwarded original. An inline forward
-   below a Gmail or Outlook marker or header block wins; otherwise it uses the first attached
-   message. It extracts:
+   failure queue instead of being dropped silently. A claim older than the Lambda timeout plus
+   60 seconds is taken over.
+4. **Parse** (`parsing.py`, pure). This step finds the forwarded original. An attached original
+   (forward as attachment) wins; otherwise it uses an inline forward below a Gmail, Outlook or
+   Apple Mail marker or header block. When there is both inline forwarded text and an attached
+   email, the report is flagged as ambiguous and the outer links and attachments are kept as
+   evidence too. It extracts:
    - identity headers: From, Reply-To, Return-Path, DKIM signing domain, and the original's
      Authentication-Results;
    - links as (anchor text, real href) pairs, including form actions and meta refreshes;
@@ -113,13 +115,13 @@ flowchart TD
      header exists. "Not flagged" is never shown to the model: nearly every reported phish got past
      the filter, so it carries no information;
    - PDF active content (JavaScript, open actions, embedded files, launch/submit actions, XFA)
-     marks the PDF uninspectable even when its text was read.
+     marks the PDF uninspectable even when its text was read;
+   - the visible text from **every** inline HTML and plain part.
 
    Attachment reading runs under a per-email budget: at most 5 PDFs, 40 pages, 25 image decodes
    and 30 seconds, with pypdf's decompression limits lowered and Pillow restricted to PNG, JPEG,
    GIF, BMP and WebP. Anything left unread is recorded as omitted evidence. Routing runs on the
    headers alone *before* this step, so a sender we won't answer never gets an attachment opened.
-   - the visible text from **every** inline HTML and plain part.
 
    Size is capped, and truncation is flagged to the model.
 5. **Route** (`handler.route_reply`, pure). A reply goes to the forwarder only if:
@@ -143,8 +145,8 @@ flowchart TD
 7. **Guardrails** (`guardrails.py`). Deterministic rules run after the model and can only raise the
    verdict. A virus verdict, hidden text addressed to AI scanners, or Microsoft 365 "high
    confidence phishing" means phishing. A Microsoft 365 phishing/spoof/spam verdict, a typosquat or
-   embedded-brand domain (`paypa1.com`, `chase.com-onlinebanking.com`), a raw-IP or punycode link, a risky file type, an attachment we can't open (PDF, archive, Office), omitted
-   evidence, or two different forwarded emails mean at least suspicious. A raised verdict lists
+   embedded-brand domain (`paypa1.com`, `chase.com-onlinebanking.com`), a raw-IP or punycode link, a risky file type, an attachment we can't open (PDF, archive, Office) or an email
+   attached inside the reported one, omitted evidence (including images skipped for QR scanning), or two different forwarded emails mean at least suspicious. A raised verdict lists
    the automated checks first.
 8. **Render** (`render.py`, pure). The HTML and plain-text replies are built from the verdict. The
    subject is fixed (`Phishing report result: <VERDICT> (ref …)`) and never echoes the phish. The

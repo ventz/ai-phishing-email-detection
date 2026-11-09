@@ -1,7 +1,7 @@
 from dataclasses import replace
 
 from conftest import forward_as_attachment, forward_inline, phish
-from phishing_detector import guardrails
+from phishing_detector import guardrails, urls
 from phishing_detector.classifier import Confidence, Label, Verdict
 from phishing_detector.parsing import Attachment, Link, SenderAuth, parse_email
 
@@ -66,6 +66,6 @@ def test_raw_ip_in_any_browser_form_is_risky():
         "198.51.100.7/x",
         "http://evil.com\\@good.com",
     ]:
-        risky = guardrails._host_is_risky(href)
+        risky = urls.host_is_risky(href)
         assert risky or "evil.com" in href, href
-    assert not guardrails._host_is_risky("https://click.mail.example.edu/x")
+    assert not urls.host_is_risky("https://click.mail.example.edu/x")

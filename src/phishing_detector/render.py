@@ -66,7 +66,9 @@ _UNAVAILABLE = _Theme(
     "#3d3d3d",
 )
 
-_URL = re.compile(r"\b(?:https?|ftp)://\S+", re.IGNORECASE)
+_URL = re.compile(r"\b(?:https?|ftps?|sftp)://\S+", re.IGNORECASE)
+_IP_HOST = re.compile(r"^(\w+://)(\d{1,3}(?:\.\d{1,3}){3})")
+_SCHEME = {"http": "hxxp", "ftp": "fxp", "sftp": "sfxp"}
 # Unicode-aware so IDN lookalikes (xn-- or raw Unicode) are defanged too.
 _DOMAIN = re.compile(r"(?<![\w-])((?:[^\W_][\w-]*\.)+)([^\W\d_]{2,24}|xn--[\w-]+)\b")
 _INVISIBLE = re.compile(r"[\u00ad\u061c\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u206f\ufeff]")
@@ -76,14 +78,19 @@ def defang(text: str) -> str:
     """hxxps://evil[.]example/login - readable, never auto-linked by mail clients. Also strips
     invisible/bidi control characters that can disguise text."""
     text = _INVISIBLE.sub("", text)
-    text = _URL.sub(lambda m: re.sub(r"^(?i:http)", "hxxp", m.group(0)), text)
+    text = _URL.sub(_defang_url, text)
     return _DOMAIN.sub(lambda m: m.group(1).replace(".", "[.]") + m.group(2), text)
+
+
+def _defang_url(m: re.Match[str]) -> str:
+    url = re.sub(r"^(?i:sftp|ftp|http)", lambda s: _SCHEME[s.group(0).lower()], m.group(0))
+    return _IP_HOST.sub(lambda h: h.group(1) + h.group(2).replace(".", "[.]"), url)
 
 
 DEFANG_NOTE = "Links and domains below are written as hxxp:// and [.] on purpose, so they cannot be clicked."
 
 
-_PHONE = re.compile(r"(?<![\w.])(?:\+\d{1,3}[ .-]?)?(?:\(\d{2,4}\) ?|\d{2,4}[ .\-–])\d{3,4}[ .-]\d{3,4}(?!\w|\.\d)")
+PHONE_RE = re.compile(r"(?<![\w.])(?:\+\d{1,3}[ .-]?)?(?:\(\d{2,4}\) ?|\d{2,4}[ .\-–])\d{3,4}[ .-]\d{3,4}(?!\w|\.\d)")
 _TEL = re.compile(r"\btel:\S+", re.IGNORECASE)
 _PHONE_DIGITS = re.compile(r"(?<![\w.])\+?\d{10,15}(?![\w]|\.\d)")
 _EMAIL = re.compile(r"(?<![\w.+-])([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\.[A-Za-z]{2,})")
@@ -99,7 +106,7 @@ def neutralize(text: str) -> str:
     fullwidth characters can't hide a number from the patterns."""
     text = _INVISIBLE.sub("", unicodedata.normalize("NFKC", text))
     text = _TEL.sub("[phone number removed]", text)
-    text = _PHONE.sub("[phone number removed]", text)
+    text = PHONE_RE.sub("[phone number removed]", text)
     text = _PHONE_DIGITS.sub("[phone number removed]", text)
     return _EMAIL.sub(lambda m: f"{m.group(1)}***@{m.group(2)}", text)
 

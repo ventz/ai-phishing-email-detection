@@ -1,6 +1,7 @@
 # Local / private (never commit)
 CLAUDE.md
 CLAUDE.local.md
+AGENTS.md
 .claude/
 .mcp.json
 .env
@@ -27,7 +28,6 @@ dist/
 
 # Build output
 build/
-function.zip
 
 # Terraform
 .terraform/
@@ -47,8 +47,6 @@ override.tf.json
 crash.*.log
 .terraformrc
 terraform.rc
-lambda_package/
-*$py.class
 
 # Temporary import blocks used when adopting an existing deployment
 terraform/imports.tf
